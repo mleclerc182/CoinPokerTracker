@@ -6,6 +6,8 @@ CoinPoker Tracker imports your local CoinPoker hand-history files and gives you 
 
 It is intentionally a **simple tracker**, not a full poker analysis suite.
 
+![Project Screenshot](assets/Overview.png)
+
 ## Download
 
 **[Download the latest Windows release](https://github.com/mleclerc182/CoinPokerTracker/releases/latest)**
