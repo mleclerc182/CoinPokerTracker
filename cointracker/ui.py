@@ -881,6 +881,16 @@ class FiltersBar(QWidget):
         self.date_from = OptionalDatePicker()
         self.date_to = OptionalDatePicker()
 
+        self.all_dates_button = QPushButton(
+            "All Dates"
+        )
+        self.all_dates_button.setToolTip(
+            "Show hands from all dates"
+        )
+        self.all_dates_button.clicked.connect(
+            self.show_all_dates
+        )
+
         self.today_button = QPushButton(
             "Today"
         )
@@ -889,16 +899,6 @@ class FiltersBar(QWidget):
         )
         self.today_button.clicked.connect(
             self.show_today
-        )
-
-        self.all_dates_button = QPushButton(
-            "All"
-        )
-        self.all_dates_button.setToolTip(
-            "Show hands from all dates"
-        )
-        self.all_dates_button.clicked.connect(
-            self.show_all_dates
         )
 
         self.stakes = QComboBox()
@@ -928,13 +928,13 @@ class FiltersBar(QWidget):
             self.changed.emit
         )
         self.stakes.currentIndexChanged.connect(
-            self.changed.emit
+            lambda _index: self.changed.emit()
         )
         self.splash.currentIndexChanged.connect(
-            self.changed.emit
+            lambda _index: self.changed.emit()
         )
         self.runs.currentIndexChanged.connect(
-            self.changed.emit
+            lambda _index: self.changed.emit()
         )
 
         lay.addWidget(QLabel("From"))
@@ -944,10 +944,10 @@ class FiltersBar(QWidget):
         lay.addWidget(self.date_to)
 
         lay.addWidget(
-            self.today_button
+            self.all_dates_button
         )
         lay.addWidget(
-            self.all_dates_button
+            self.today_button
         )
 
         lay.addWidget(QLabel("Stakes"))
