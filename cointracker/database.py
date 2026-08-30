@@ -11,7 +11,6 @@ from .equity import evaluator_available
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
-
 CREATE TABLE IF NOT EXISTS hands (
     hand_id TEXT PRIMARY KEY,
     game TEXT NOT NULL,
@@ -57,7 +56,6 @@ CREATE INDEX IF NOT EXISTS idx_hands_started ON hands(started_at);
 CREATE INDEX IF NOT EXISTS idx_hands_stakes ON hands(sb_cents, bb_cents);
 CREATE INDEX IF NOT EXISTS idx_hands_splash ON hands(splash_cents);
 CREATE INDEX IF NOT EXISTS idx_hands_runs ON hands(run_count);
-
 CREATE TABLE IF NOT EXISTS seats (
     hand_id TEXT NOT NULL REFERENCES hands(hand_id) ON DELETE CASCADE,
     seat_no INTEGER NOT NULL,
@@ -67,7 +65,6 @@ CREATE TABLE IF NOT EXISTS seats (
     PRIMARY KEY(hand_id, seat_no)
 );
 CREATE INDEX IF NOT EXISTS idx_seats_player ON seats(player);
-
 CREATE TABLE IF NOT EXISTS actions (
     hand_id TEXT NOT NULL REFERENCES hands(hand_id) ON DELETE CASCADE,
     seq INTEGER NOT NULL,
@@ -83,7 +80,6 @@ CREATE TABLE IF NOT EXISTS actions (
     PRIMARY KEY(hand_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_actions_player ON actions(player);
-
 CREATE TABLE IF NOT EXISTS player_results (
     hand_id TEXT NOT NULL REFERENCES hands(hand_id) ON DELETE CASCADE,
     player TEXT NOT NULL,
@@ -105,15 +101,36 @@ CREATE TABLE IF NOT EXISTS player_results (
     PRIMARY KEY(hand_id, player)
 );
 CREATE INDEX IF NOT EXISTS idx_player_results_player ON player_results(player);
-
 CREATE TABLE IF NOT EXISTS tracker_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS rakeback_by_stake (
+    bb_cents INTEGER PRIMARY KEY,
+    sb_cents INTEGER NOT NULL,
+    amount_cents INTEGER NOT NULL DEFAULT 0 CHECK(amount_cents >= 0)
+);
 """
 
-CALCULATION_VERSION = "14-stable-rollback-v11-pot-layer-v1"
+# CoinPoker's standard published NLHE/PLO cash ladder. The UI also adds any
+# other stakes already present in the user's hand-history database so VIP or
+# uncommon games remain selectable.
+COIN_CASH_STAKES = (
+    (1, 2),
+    (2, 5),
+    (5, 10),
+    (10, 25),
+    (25, 50),
+    (50, 100),
+    (100, 200),
+    (200, 500),
+    (500, 1000),
+    (1000, 2000),
+    (2500, 5000),
+    (5000, 10000),
+)
 
+CALCULATION_VERSION = "14-stable-rollback-v11-pot-layer-v1"
 
 class TrackerDB:
     def __init__(self, path: str | Path, migration_progress: Callable[[int, int], None] | None = None):
@@ -127,7 +144,6 @@ class TrackerDB:
         self.recalculation_errors = 0
         self._ensure_columns()
         self._migrate_calculations_if_needed()
-
     def _ensure_columns(self):
         """Add columns needed by newer builds without replacing the user's DB."""
         hands_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(hands)")}
@@ -157,7 +173,6 @@ class TrackerDB:
                 self.conn.execute(
                     "ALTER TABLE hands ADD COLUMN hero_allin_estimated INTEGER NOT NULL DEFAULT 0"
                 )
-
     def _meta(self, key: str) -> str | None:
         row = self.conn.execute("SELECT value FROM tracker_meta WHERE key=?", (key,)).fetchone()
         return row[0] if row else None
@@ -168,7 +183,6 @@ class TrackerDB:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value),
         )
-
     def _migrate_calculations_if_needed(self):
         if self._meta("calculation_version") == CALCULATION_VERSION:
             return
@@ -179,7 +193,6 @@ class TrackerDB:
         if self.recalculation_errors == 0:
             with self.conn:
                 self._set_meta("calculation_version", CALCULATION_VERSION)
-
     def recalculate_all_hands(self) -> int:
         """Reparse stored raw HH so formula fixes apply to already-imported hands."""
         rows = self.conn.execute(
@@ -191,7 +204,6 @@ class TrackerDB:
         total_rows = len(rows)
         if self.migration_progress:
             self.migration_progress(0, total_rows)
-
         hand_updates = []
         result_updates = []
         self.recalculation_errors = 0
@@ -219,7 +231,6 @@ class TrackerDB:
             ) for p in hand.player_results.values())
             if self.migration_progress and (index == total_rows or index % 100 == 0):
                 self.migration_progress(index, total_rows)
-
         with self.conn:
             self.conn.executemany(
                 """UPDATE hands SET
@@ -238,7 +249,6 @@ class TrackerDB:
                 result_updates,
             )
         return len(hand_updates)
-
     def close(self):
         self.conn.close()
 
@@ -246,7 +256,6 @@ class TrackerDB:
         batch = list(hands)
         if not batch:
             return 0, 0
-
         ids = [h.hand_id for h in batch]
         existing: set[str] = set()
         # Keep comfortably under SQLite's parameter limit.
@@ -256,12 +265,10 @@ class TrackerDB:
             existing.update(r[0] for r in self.conn.execute(
                 f"SELECT hand_id FROM hands WHERE hand_id IN ({marks})", chunk
             ).fetchall())
-
         new_hands = [h for h in batch if h.hand_id not in existing]
         duplicates = len(batch) - len(new_hands)
         if not new_hands:
             return 0, duplicates
-
         hand_rows = []
         seat_rows = []
         action_rows = []
@@ -294,7 +301,6 @@ class TrackerDB:
                 int(p.vpip), int(p.pfr), int(p.three_bet), int(p.three_bet_opp), int(p.saw_flop),
                 int(p.went_to_showdown), int(p.won_showdown)
             ) for p in hand.player_results.values())
-
         with self.conn:
             self.conn.executemany(
                 """INSERT INTO hands (
@@ -326,7 +332,6 @@ class TrackerDB:
                 result_rows,
             )
         return len(new_hands), duplicates
-
     @staticmethod
     def _where(filters: dict | None) -> tuple[str, list]:
         filters = filters or {}
@@ -353,6 +358,55 @@ class TrackerDB:
             clauses.append("hero_position = ?")
             params.append(filters["position"])
         return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+    def rakeback_stakes(self) -> list[tuple[int, int]]:
+        """Return CoinPoker's standard cash stakes plus any stakes seen in this DB."""
+        by_bb = {bb: (sb, bb) for sb, bb in COIN_CASH_STAKES}
+        for sb, bb in self.distinct_stakes():
+            by_bb[bb] = (sb, bb)
+        return sorted(by_bb.values(), key=lambda stake: (stake[1], stake[0]))
+
+    def rakeback_cents(self, bb_cents: int) -> int:
+        row = self.conn.execute(
+            "SELECT amount_cents FROM rakeback_by_stake WHERE bb_cents=?",
+            (int(bb_cents),),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def set_rakeback_cents(self, sb_cents: int, bb_cents: int, amount_cents: int):
+        amount_cents = max(0, int(amount_cents))
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO rakeback_by_stake(bb_cents, sb_cents, amount_cents)
+                   VALUES(?,?,?)
+                   ON CONFLICT(bb_cents) DO UPDATE SET
+                       sb_cents=excluded.sb_cents,
+                       amount_cents=excluded.amount_cents""",
+                (int(bb_cents), int(sb_cents), amount_cents),
+            )
+
+    def _rakeback_totals(self, filters: dict | None = None) -> tuple[int, float]:
+        """Return cash rakeback and its BB equivalent for the selected stake(s)."""
+        filters = filters or {}
+        selected_bb = filters.get("bb_cents")
+        if selected_bb is None:
+            row = self.conn.execute(
+                """SELECT
+                       COALESCE(SUM(amount_cents), 0) amount_cents,
+                       COALESCE(SUM(CASE WHEN bb_cents > 0
+                           THEN CAST(amount_cents AS REAL) / bb_cents ELSE 0 END), 0) amount_bb
+                   FROM rakeback_by_stake"""
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                """SELECT
+                       COALESCE(SUM(amount_cents), 0) amount_cents,
+                       COALESCE(SUM(CASE WHEN bb_cents > 0
+                           THEN CAST(amount_cents AS REAL) / bb_cents ELSE 0 END), 0) amount_bb
+                   FROM rakeback_by_stake WHERE bb_cents=?""",
+                (int(selected_bb),),
+            ).fetchone()
+        return int(row["amount_cents"] or 0), float(row["amount_bb"] or 0)
 
     def overview(self, filters: dict | None = None) -> dict:
         where, params = self._where(filters)
@@ -381,14 +435,23 @@ class TrackerDB:
         wtsd = r["wtsd_n"] or 0
         saw_flop = r["saw_flop_n"] or 0
         three_bet_opp = r["three_bet_opp_n"] or 0
+        net_cents = int(r["net_cents"] or 0)
+        net_bb = float(r["net_bb"] or 0)
+        rakeback_cents, rakeback_bb = self._rakeback_totals(filters)
+        post_rb_net_cents = net_cents + rakeback_cents
+        post_rb_net_bb = net_bb + rakeback_bb
         return {
             "hands": hands,
-            "net_cents": r["net_cents"] or 0,
+            "net_cents": net_cents,
+            "rakeback_cents": rakeback_cents,
+            "net_post_rb_cents": post_rb_net_cents,
+            "net_bb_post_rb": post_rb_net_bb,
+            "bb100_post_rb": (post_rb_net_bb * 100 / hands) if hands else 0.0,
             "allin_adj_cents": float(r["allin_adj_cents"] or 0),
             "splash_won_cents": r["splash_won_cents"] or 0,
             "rake_cents": r["rake_cents"] or 0,
-            "net_bb": float(r["net_bb"] or 0),
-            "bb100": (float(r["net_bb"] or 0) * 100 / hands) if hands else 0.0,
+            "net_bb": net_bb,
+            "bb100": (net_bb * 100 / hands) if hands else 0.0,
             "allin_adj_bb": float(r["allin_adj_bb"] or 0),
             "allin_adj_bb100": (float(r["allin_adj_bb"] or 0) * 100 / hands) if hands else 0.0,
             "allin_adjusted_hands": r["allin_adjusted_hands"] or 0,
@@ -401,18 +464,15 @@ class TrackerDB:
             "splash_hands": r["splash_hands"] or 0,
             "multi_run_hands": r["multi_run_hands"] or 0,
         }
-
     def profit_points(self, filters: dict | None = None) -> list[sqlite3.Row]:
         where, params = self._where(filters)
         return self.conn.execute(
             f"SELECT hand_id, started_at, hero_net_cents, hero_allin_adj_cents, hero_wtsd FROM hands{where} ORDER BY started_at, hand_id", params
         ).fetchall()
-
     def distinct_stakes(self) -> list[tuple[int, int]]:
         return [(r[0], r[1]) for r in self.conn.execute(
             "SELECT DISTINCT sb_cents, bb_cents FROM hands ORDER BY bb_cents, sb_cents"
         ).fetchall()]
-
     def hands(self, filters: dict | None = None, limit: int = 2000) -> list[sqlite3.Row]:
         where, params = self._where(filters)
         params = list(params) + [limit]
@@ -423,7 +483,6 @@ class TrackerDB:
                 hero_allin_adj_cents, hero_allin_equity, hero_allin_adjusted, hero_allin_estimated
                 FROM hands{where} ORDER BY started_at DESC, hand_id DESC LIMIT ?""", params
         ).fetchall()
-
     def raw_hand(self, hand_id: str) -> str:
         r = self.conn.execute("SELECT raw_text FROM hands WHERE hand_id=?", (hand_id,)).fetchone()
         return r[0] if r else ""
@@ -433,7 +492,6 @@ class TrackerDB:
         ids = list(dict.fromkeys(str(hand_id) for hand_id in hand_ids if hand_id))
         if not ids:
             return 0
-
         deleted = 0
         with self.conn:
             # Keep comfortably under SQLite's parameter limit. Foreign keys on
@@ -447,7 +505,6 @@ class TrackerDB:
                 self.conn.execute(f"DELETE FROM hands WHERE hand_id IN ({marks})", chunk)
                 deleted += existing
         return deleted
-
     def sessions(self, gap_minutes: int = 30, filters: dict | None = None) -> list[dict]:
         where, params = self._where(filters)
         rows = self.conn.execute(
@@ -472,7 +529,6 @@ class TrackerDB:
             if r["bb_cents"]:
                 current["net_bb"] += r["hero_net_cents"] / r["bb_cents"]
         return list(reversed(out))
-
     def positional(self, filters: dict | None = None) -> list[sqlite3.Row]:
         where, params = self._where(filters)
         return self.conn.execute(
