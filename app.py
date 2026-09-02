@@ -4,15 +4,29 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QStandardPaths, Qt
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QProgressDialog
 
 from cointracker.ui import MainWindow
+
+
+def resource_path(relative_path: str) -> Path:
+    if getattr(sys, "frozen", False):
+        # PyInstaller --onedir puts bundled data under _internal
+        return Path(sys.executable).resolve().parent / "_internal" / relative_path
+
+    return Path(__file__).resolve().parent / relative_path
 
 
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setApplicationName("CoinPoker Tracker")
+
+    app.setWindowIcon(
+        QIcon(str(resource_path("assets/coinpoker_tracker.png")))
+    )
+
     data_dir = Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))
     data_dir.mkdir(parents=True, exist_ok=True)
     db_path = data_dir / "coinpoker_tracker.sqlite3"
@@ -29,6 +43,7 @@ def main():
     def migration_progress(current: int, total: int):
         if not migration.isVisible():
             migration.show()
+
         if total > 0:
             migration.setRange(0, total)
             migration.setValue(min(current, total))
@@ -39,11 +54,20 @@ def main():
         else:
             migration.setRange(0, 0)
             migration.setLabelText("Preparing tracker database…")
+
         app.processEvents()
 
-    w = MainWindow(str(db_path), migration_progress=migration_progress)
+    w = MainWindow(
+        str(db_path),
+        migration_progress=migration_progress,
+
+    )
+    w.setWindowIcon(
+        QIcon(str(resource_path("assets/coinpoker_tracker.png")))
+    )
     migration.close()
     w.show()
+
     return app.exec()
 
 

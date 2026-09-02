@@ -5,3 +5,8 @@ build/
 dist/
 *.spec
 *.sqlite3
+/.idea/.gitignore
+/.idea/CoinPokerTracker_v0.20.iml
+/.idea/misc.xml
+/.idea/modules.xml
+/.idea/vcs.xml

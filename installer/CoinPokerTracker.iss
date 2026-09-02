@@ -32,6 +32,9 @@ DisableProgramGroupPage=yes
 OutputDir=Output
 OutputBaseFilename=CoinPokerTracker-Setup
 
+;Icon
+SetupIconFile=..\assets\coinpoker_tracker.ico
+
 ; Compression
 Compression=lzma2
 SolidCompression=yes
@@ -58,11 +61,15 @@ Source: "..\dist\CoinPokerTracker\*"; \
 [Icons]
 ; Start Menu shortcut
 Name: "{autoprograms}\{#MyAppName}"; \
-    Filename: "{app}\{#MyAppExeName}"
+    Filename: "{app}\{#MyAppExeName}"; \
+    IconFilename: "{app}\{#MyAppExeName}"; \
+    AppUserModelID: "mleclerc182.CoinPokerTracker"
 
 ; Optional desktop shortcut
 Name: "{autodesktop}\{#MyAppName}"; \
     Filename: "{app}\{#MyAppExeName}"; \
+    IconFilename: "{app}\{#MyAppExeName}"; \
+    AppUserModelID: "mleclerc182.CoinPokerTracker"; \
     Tasks: desktopicon
 
 [Run]

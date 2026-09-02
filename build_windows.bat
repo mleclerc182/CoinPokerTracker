@@ -12,5 +12,5 @@ if not exist .venv\Scripts\python.exe (
 )
 .venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 if errorlevel 1 exit /b 1
-.venv\Scripts\pyinstaller.exe --noconfirm --windowed --name CoinPokerTracker app.py
+.venv\Scripts\pyinstaller.exe --noconfirm --clean --windowed --name CoinPokerTracker --icon "%~dp0assets\coinpoker_tracker.ico" --add-data "%~dp0assets\coinpoker_tracker.png;assets" app.py 
 echo Built executable is under dist\CoinPokerTracker\
