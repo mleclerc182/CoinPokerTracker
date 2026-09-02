@@ -2,7 +2,7 @@
 ; Built with Inno Setup
 
 #define MyAppName "CoinPoker Tracker"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.5"
 #define MyAppPublisher "mleclerc182"
 #define MyAppExeName "CoinPokerTracker.exe"
 
@@ -39,6 +39,10 @@ SetupIconFile=..\assets\coinpoker_tracker.ico
 Compression=lzma2
 SolidCompression=yes
 
+; Sigmomg
+SignTool=ArtifactSigning
+SignedUninstaller=yes
+
 ; Installer appearance
 WizardStyle=modern dynamic
 
@@ -52,10 +56,15 @@ Name: "desktopicon"; \
     Flags: unchecked
 
 [Files]
-; The .iss file lives in installer\
-; The PyInstaller build lives in ..\dist\CoinPokerTracker\
+; Sign only the main application EXE
+Source: "..\dist\CoinPokerTracker\CoinPokerTracker.exe"; \
+    DestDir: "{app}"; \
+    Flags: ignoreversion signonce
+
+; Copy everything else, but don't sign it
 Source: "..\dist\CoinPokerTracker\*"; \
     DestDir: "{app}"; \
+    Excludes: "CoinPokerTracker.exe"; \
     Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
