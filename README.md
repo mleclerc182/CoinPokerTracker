@@ -14,7 +14,7 @@ Open the latest release and download:
 
 `CoinPokerTracker-Setup.exe`
 
-> **Windows SmartScreen:** The installer may currently show an "unrecognized app" warning because the application is not code-signed. You will need to choose **Run anyway**.
+> **Windows SmartScreen:** The installer may currently show an "unrecognized app" warning because the application is not code-signed. You will need to  review the warning and choose **Run anyway**.
 
 ## What it does
 
@@ -98,7 +98,22 @@ I am **not currently looking to manage outside code contributions or pull reques
 
 The project is written in Python using PySide6.
 
-For a local Windows development build, clone the repository and run:
+For local development, first create a virtual environment and install the development requirements:
+
+```bat
+py -3.12 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+```
+
+If you only want to run the app from source and do not need the test/build tooling, you can install `requirements.txt` instead:
+
+```bat
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+After installing the requirements, you can run or debug the application directly from `app.py`. In PyCharm, open `app.py` and press the Run or Debug button; other editors and IDEs can run the same file using their equivalent Python run/debug command.
+
+For a packaged local Windows build, run:
 
 ```bat
 build_windows.bat
@@ -115,6 +130,15 @@ The Windows installer is built with Inno Setup using:
 ```text
 installer\CoinPokerTracker.iss
 ```
+
+## Support
+
+If CoinPoker Tracker has been useful to you and you would like to support the project, donations are appreciated but never expected.
+
+**[☕ Buy me a coffee](https://buymeacoffee.com/mleclerc182)**
+
+Thank you for using CoinPoker Tracker, and thank you for any bug reports or feature suggestions that help make it better.
+
 
 ## Disclaimer
 
