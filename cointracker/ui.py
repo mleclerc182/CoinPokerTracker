@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-
 from PySide6.QtCore import QDate, QSettings, Qt, Signal, QThread
 from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
@@ -13,7 +12,6 @@ from PySide6.QtWidgets import (
     QPushButton, QSplitter, QStyledItemDelegate, QStyle, QStyleOptionViewItem, QTabWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget
 )
-
 from .database import TrackerDB
 from .equity import evaluator_available
 from .importer import import_file, import_folder
@@ -22,16 +20,18 @@ from .handtable import card_text_segments, hole_card_sort_key, normalize_hole_ca
 
 
 OVERVIEW_CARD_TITLES = [
-    "Hands", "Net", "Splash won", "bb/100", "All-in Adj Net Won",
-    "All-in Adj BB", "Adj bb/100", "AI adj hands", "VPIP", "PFR", "3-Bet",
-    "WWSF", "WTSD", "W$SD", "Splash hands", "RIT hands",
+    "Hands", "Net Won","All-in Adj Net Won","bb/100","Adj bb/100", "Net Won post RB", "bb/100 post RB",
+     "VPIP", "PFR",  "3-Bet", "All-in Adj BB",  "AI adj hands",  "WWSF", "WTSD", "W$SD",
+     "Splash won", "Splash hands", "RIT hands", "Rakeback Amount",
 ]
-
 CARD_ACCENTS = {
     "Hands": "#8b5cf6",
-    "Net": "#22c55e",
+    "Net Won": "#22c55e",
+    "Rakeback Amount": "#14b8a6",
+    "Net Won post RB": "#4ade80",
     "Splash won": "#f59e0b",
     "bb/100": "#10b981",
+    "bb/100 post RB": "#34d399",
     "All-in Adj Net Won": "#eab308",
     "All-in Adj BB": "#facc15",
     "Adj bb/100": "#fde047",
@@ -85,7 +85,18 @@ class StatCard(QFrame):
                 "Won When Saw Flop: percentage of flops seen where Hero "
                 "won at least part of the pot."
             )
-
+        elif title == "Rakeback Amount":
+            self.setToolTip(
+                "Manual rakeback stored for the selected stake(s)."
+            )
+        elif title == "Net Won post RB":
+            self.setToolTip(
+                "Net winnings plus manual rakeback stored for the selected stake(s)."
+            )
+        elif title == "bb/100 post RB":
+            self.setToolTip(
+                "bb/100 after adding each stake's manual rakeback in big-blind terms."
+            )
         self.value = QLabel("—")
         self.value.setStyleSheet("color: #f8fbff;")
         f = self.value.font()
@@ -98,7 +109,6 @@ class StatCard(QFrame):
 
 class OverviewCardsDialog(QDialog):
     """Reorder and show/hide Overview stat cards."""
-
     def __init__(self, order: list[str], hidden: set[str], parent=None):
         super().__init__(parent)
         self.setWindowTitle("Customize Overview cards")
@@ -112,7 +122,6 @@ class OverviewCardsDialog(QDialog):
         )
         help_text.setWordWrap(True)
         lay.addWidget(help_text)
-
         self.list = QListWidget()
         self.list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.list.setDragDropMode(QAbstractItemView.InternalMove)
@@ -124,7 +133,6 @@ class OverviewCardsDialog(QDialog):
         self.list.setDropIndicatorShown(True)
 
         lay.addWidget(self.list, 1)
-
         reset = QPushButton("Reset to default layout")
         reset.clicked.connect(self.reset_defaults)
         lay.addWidget(reset)
@@ -140,7 +148,6 @@ class OverviewCardsDialog(QDialog):
 
     def _populate(self, order: list[str], hidden: set[str]):
         self.list.clear()
-
         for title in order:
             item = QListWidgetItem(title)
             item.setFlags(
@@ -172,7 +179,6 @@ class OverviewCardsDialog(QDialog):
                 continue
 
             order.append(title)
-
             if item.checkState() != Qt.Checked:
                 hidden.add(title)
 
@@ -185,12 +191,146 @@ class OverviewCardsDialog(QDialog):
         return order, hidden
 
 
+class RakebackDialog(QDialog):
+    """Edit the manual rakeback amount for one cash-game stake."""
+
+    def __init__(
+        self,
+        db: TrackerDB,
+        selected_bb_cents: int | None = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.db = db
+        self.setWindowTitle("Manual rakeback")
+        self.setMinimumWidth(380)
+
+        lay = QVBoxLayout(self)
+
+        help_text = QLabel(
+            "Enter your cumulative rakeback for a cash-game stake. "
+            "The amount is stored in the tracker database and only "
+            "affects that stake's post-RB results."
+        )
+        help_text.setWordWrap(True)
+        lay.addWidget(help_text)
+
+        form = QGridLayout()
+        form.addWidget(QLabel("Stake"), 0, 0)
+
+        self.stake = QComboBox()
+        self.stake.setMinimumWidth(170)
+        for sb, bb in self.db.rakeback_stakes():
+            self.stake.addItem(
+                f"{fmt_money(sb)}/{fmt_money(bb)}",
+                (int(sb), int(bb)),
+            )
+        form.addWidget(self.stake, 0, 1)
+
+        form.addWidget(QLabel("Rakeback (₮)"), 1, 0)
+        self.amount = QLineEdit()
+        self.amount.setPlaceholderText("0.00")
+        self.amount.setToolTip(
+            "Cumulative manual rakeback for the selected stake."
+        )
+        form.addWidget(self.amount, 1, 1)
+        lay.addLayout(form)
+
+        self.stake.currentIndexChanged.connect(
+            self._load_amount
+        )
+
+        if selected_bb_cents is not None:
+            for index in range(self.stake.count()):
+                data = self.stake.itemData(index)
+                if data and int(data[1]) == int(selected_bb_cents):
+                    self.stake.setCurrentIndex(index)
+                    break
+
+        self._load_amount()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Save | QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+    def _load_amount(self):
+        data = self.stake.currentData()
+        if not data:
+            self.amount.setText("0.00")
+            return
+
+        _sb_cents, bb_cents = data
+        cents = self.db.rakeback_cents(int(bb_cents))
+        self.amount.setText(f"{cents / 100:.2f}")
+        self.amount.selectAll()
+
+    def _amount_cents(self) -> int | None:
+        text = (
+            self.amount.text()
+            .strip()
+            .replace(",", "")
+            .replace("₮", "")
+            .replace("$", "")
+        )
+        if not text:
+            return 0
+
+        try:
+            amount = float(text)
+        except ValueError:
+            return None
+
+        if amount < 0:
+            return None
+
+        return int(round(amount * 100))
+
+    def _save(self):
+        data = self.stake.currentData()
+        if not data:
+            return
+
+        cents = self._amount_cents()
+        if cents is None:
+            QMessageBox.warning(
+                self,
+                "Invalid rakeback",
+                "Enter a non-negative rakeback amount, for example 100.",
+            )
+            self.amount.setFocus()
+            self.amount.selectAll()
+            return
+
+        sb_cents, bb_cents = data
+        self.db.set_rakeback_cents(
+            int(sb_cents),
+            int(bb_cents),
+            cents,
+        )
+        self.accept()
+
+    def saved_value(self) -> tuple[int, int, int]:
+        data = self.stake.currentData()
+        if not data:
+            return 0, 0, 0
+        sb_cents, bb_cents = data
+        return (
+            int(sb_cents),
+            int(bb_cents),
+            self.db.rakeback_cents(int(bb_cents)),
+        )
+
+
 class ProfitGraph(QWidget):
     SERIES_COLORS = {
         "showdown": QColor("#3498db"),
         "allin_adj": QColor("#f1c40f"),
         "nonshowdown": QColor("#e74c3c"),
         "net": QColor("#2ecc71"),
+        "net_post_rb": QColor("#CB00F5"),
     }
 
     def __init__(self):
@@ -201,8 +341,8 @@ class ProfitGraph(QWidget):
             "allin_adj": [0.0],
             "nonshowdown": [0.0],
             "net": [0.0],
+            "net_post_rb": [0.0],
         }
-
         self.visible_series = set(self.series)
         self.setMinimumHeight(260)
 
@@ -221,6 +361,7 @@ class ProfitGraph(QWidget):
         self,
         *,
         net: list[float],
+        net_post_rb: list[float],
         showdown: list[float],
         allin_adj: list[float],
         nonshowdown: list[float],
@@ -230,6 +371,7 @@ class ProfitGraph(QWidget):
             "allin_adj": self._cumulative(allin_adj),
             "nonshowdown": self._cumulative(nonshowdown),
             "net": self._cumulative(net),
+            "net_post_rb": self._cumulative(net_post_rb),
         }
 
         self.update()
@@ -262,7 +404,6 @@ class ProfitGraph(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.fillRect(self.rect(), QColor("#0d1627"))
-
         rect = self.rect().adjusted(12, 15, -86, -38)
 
         available = [
@@ -273,7 +414,6 @@ class ProfitGraph(QWidget):
 
         if not available:
             p.setPen(self.palette().text().color())
-
             if any(len(points) >= 2 for points in self.series.values()):
                 p.drawText(
                     rect,
@@ -309,7 +449,6 @@ class ProfitGraph(QWidget):
 
         text_pen = QPen(QColor("#b8c7e0"))
         tick_len = 5
-
         y = axis_lo
 
         while y <= axis_hi + y_step * 0.5:
@@ -324,7 +463,6 @@ class ProfitGraph(QWidget):
                 rect.right(),
                 int(py),
             )
-
             p.setPen(text_pen)
             p.drawLine(
                 rect.right(),
@@ -342,7 +480,6 @@ class ProfitGraph(QWidget):
                 0,
             )
             label_rect.setHeight(20)
-
             p.drawText(
                 label_rect,
                 Qt.AlignLeft | Qt.AlignVCenter,
@@ -357,7 +494,6 @@ class ProfitGraph(QWidget):
             px = rect.left() + (
                 hand_no / max(1, hands)
             ) * rect.width()
-
             p.setPen(grid_pen)
             p.drawLine(
                 int(px),
@@ -377,7 +513,6 @@ class ProfitGraph(QWidget):
             label = f"{hand_no:,}"
             fm = p.fontMetrics()
             width = fm.horizontalAdvance(label) + 8
-
             label_rect = self.rect().adjusted(
                 int(px) - width // 2,
                 rect.bottom() + 8,
@@ -392,7 +527,6 @@ class ProfitGraph(QWidget):
 
             if label_rect.right() > rect.right():
                 label_rect.moveRight(rect.right())
-
             p.drawText(
                 label_rect,
                 Qt.AlignHCenter | Qt.AlignTop,
@@ -412,7 +546,6 @@ class ProfitGraph(QWidget):
             y0 = rect.bottom() - (
                 (0 - axis_lo) / axis_span
             ) * rect.height()
-
             p.drawLine(
                 rect.left(),
                 int(y0),
@@ -425,6 +558,7 @@ class ProfitGraph(QWidget):
             "allin_adj",
             "nonshowdown",
             "net",
+            "net_post_rb",
         ]
 
         for key in draw_order:
@@ -435,7 +569,6 @@ class ProfitGraph(QWidget):
 
             if len(points) < 2:
                 continue
-
             pen = QPen(self.SERIES_COLORS[key])
             pen.setWidth(2)
 
@@ -452,7 +585,6 @@ class ProfitGraph(QWidget):
                 y = rect.bottom() - (
                     (val - axis_lo) / axis_span
                 ) * rect.height()
-
                 path_points.append(
                     (int(x), int(y))
                 )
@@ -471,7 +603,6 @@ class ProfitGraph(QWidget):
 
 class SortableTableWidgetItem(QTableWidgetItem):
     """QTableWidgetItem with an explicit typed sort value."""
-
     def __init__(self, text: str, sort_value=None):
         super().__init__(text)
 
@@ -488,7 +619,6 @@ class SortableTableWidgetItem(QTableWidgetItem):
         ):
             a = self.sort_value
             b = other.sort_value
-
             try:
                 return a < b
             except TypeError:
@@ -511,7 +641,6 @@ class CardSuitDelegate(QStyledItemDelegate):
         )
 
         segments = card_text_segments(text)
-
         if (
             not segments
             or not any(
@@ -529,7 +658,6 @@ class CardSuitDelegate(QStyledItemDelegate):
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
         opt.text = ""
-
         style = (
             opt.widget.style()
             if opt.widget
@@ -548,7 +676,6 @@ class CardSuitDelegate(QStyledItemDelegate):
 
         fm = option.fontMetrics
         x = option.rect.left() + 6
-
         baseline = option.rect.top() + (
             option.rect.height()
             + fm.ascent()
@@ -569,7 +696,6 @@ class CardSuitDelegate(QStyledItemDelegate):
         for chunk, color in segments:
             if not chunk:
                 continue
-
             painter.setPen(
                 QColor(color)
                 if color
@@ -632,7 +758,6 @@ class ImportWorker(QThread):
 
     def run(self):
         db = TrackerDB(self.db_path)
-
         try:
             if self.is_folder:
                 result = import_folder(
@@ -650,7 +775,6 @@ class ImportWorker(QThread):
                 )
 
             self.finished_import.emit(*result)
-
         except Exception as e:
             self.failed.emit(
                 f"{type(e).__name__}: {e}"
@@ -690,7 +814,6 @@ class OptionalDatePicker(QWidget):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
-
         self.field = ClickableDateField()
         self.field.setText("Any")
         self.field.setMinimumWidth(110)
@@ -700,7 +823,6 @@ class OptionalDatePicker(QWidget):
         self.field.clicked.connect(
             self.show_calendar
         )
-
         self.field.setStyleSheet(
             """
             QLineEdit {
@@ -710,7 +832,6 @@ class OptionalDatePicker(QWidget):
             }
             """
         )
-
         self.drop_button = QPushButton("▼")
         self.drop_button.setFixedWidth(30)
         self.drop_button.setToolTip(
@@ -722,7 +843,6 @@ class OptionalDatePicker(QWidget):
         self.drop_button.clicked.connect(
             self.show_calendar
         )
-
         self.drop_button.setStyleSheet(
             """
             QPushButton {
@@ -761,7 +881,6 @@ class OptionalDatePicker(QWidget):
         ):
             self.clearDate()
             return
-
         changed = (
             not self.has_date()
             or self._date != date
@@ -802,7 +921,6 @@ class OptionalDatePicker(QWidget):
         popup.setObjectName(
             "dateCalendarPopup"
         )
-
         popup.setStyleSheet(
             """
             QFrame#dateCalendarPopup {
@@ -827,7 +945,6 @@ class OptionalDatePicker(QWidget):
         calendar = QCalendarWidget(
             popup
         )
-
         calendar.setGridVisible(False)
         calendar.setSelectedDate(selected)
         calendar.setCurrentPage(
@@ -848,7 +965,6 @@ class OptionalDatePicker(QWidget):
         self._popup = popup
 
         popup.adjustSize()
-
         popup.move(
             self.mapToGlobal(
                 self.rect().bottomLeft()
@@ -875,7 +991,6 @@ class FiltersBar(QWidget):
             0,
             0,
         )
-
         # None means "Any".
         # No fake year-2000 sentinel is used.
         self.date_from = OptionalDatePicker()
@@ -890,7 +1005,6 @@ class FiltersBar(QWidget):
         self.all_dates_button.clicked.connect(
             self.show_all_dates
         )
-
         self.today_button = QPushButton(
             "Today"
         )
@@ -911,7 +1025,6 @@ class FiltersBar(QWidget):
                 "Exclude splash",
             ]
         )
-
         self.runs = QComboBox()
         self.runs.addItems(
             [
@@ -920,7 +1033,6 @@ class FiltersBar(QWidget):
                 "Run it 2x/3x",
             ]
         )
-
         self.date_from.dateChanged.connect(
             self.changed.emit
         )
@@ -936,7 +1048,6 @@ class FiltersBar(QWidget):
         self.runs.currentIndexChanged.connect(
             lambda _index: self.changed.emit()
         )
-
         lay.addWidget(QLabel("From"))
         lay.addWidget(self.date_from)
 
@@ -977,7 +1088,6 @@ class FiltersBar(QWidget):
     def show_all_dates(self):
         self.date_from.blockSignals(True)
         self.date_to.blockSignals(True)
-
         self.date_from.clearDate()
         self.date_to.clearDate()
 
@@ -999,7 +1109,6 @@ class FiltersBar(QWidget):
             "All stakes",
             None,
         )
-
         for sb, bb in db.distinct_stakes():
             self.stakes.addItem(
                 f"{fmt_money(sb)}/{fmt_money(bb)}",
@@ -1015,7 +1124,6 @@ class FiltersBar(QWidget):
 
     def filters(self) -> dict:
         f = {}
-
         if self.date_from.has_date():
             f["date_from"] = (
                 self.date_from.date()
@@ -1032,7 +1140,6 @@ class FiltersBar(QWidget):
             f["bb_cents"] = int(
                 self.stakes.currentData()
             )
-
         f["splash"] = {
             1: "only",
             2: "exclude",
@@ -1059,7 +1166,6 @@ class MainWindow(QMainWindow):
         migration_progress=None,
     ):
         super().__init__()
-
         self.db_path = db_path
         self.db = TrackerDB(
             db_path,
@@ -1079,9 +1185,8 @@ class MainWindow(QMainWindow):
         self.worker = None
 
         self.setWindowTitle(
-            "CoinPoker Tracker v1.0.2"
+            "CoinPoker Tracker v1.0.4"
         )
-
         self.resize(
             1280,
             800,
@@ -1100,7 +1205,6 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
-
         self._build_overview()
         self._build_hands()
         self._build_sessions()
@@ -1108,7 +1212,6 @@ class MainWindow(QMainWindow):
         self._build_menu()
 
         self.refresh_all()
-
         if self.db.recalculation_errors:
             QMessageBox.warning(
                 self,
@@ -1120,7 +1223,6 @@ class MainWindow(QMainWindow):
                 "Please export/re-import those hands or send the raw "
                 "hand(s) for parser support.",
             )
-
         elif self.db.recalculated_count:
             self.statusBar().showMessage(
                 f"Recalculated "
@@ -1128,7 +1230,6 @@ class MainWindow(QMainWindow):
                 f"existing hands with deterministic all-in EV.",
                 15000,
             )
-
         if not evaluator_available():
             self.statusBar().showMessage(
                 "eval7 is unavailable; preflop EV remains reproducible "
@@ -1143,7 +1244,6 @@ class MainWindow(QMainWindow):
                 background-color: #09111f;
                 color: #e8eefc;
             }
-
             QWidget {
                 color: #e8eefc;
                 font-size: 10pt;
@@ -1162,7 +1262,6 @@ class MainWindow(QMainWindow):
                 color: #ffffff;
                 border-radius: 4px;
             }
-
             QMenu {
                 background-color: #111c30;
                 border: 1px solid #31405d;
@@ -1175,7 +1274,6 @@ class MainWindow(QMainWindow):
                 background-color: #0d1627;
                 top: -1px;
             }
-
             QTabBar::tab {
                 background-color: #121d32;
                 color: #91a4c8;
@@ -1187,7 +1285,6 @@ class MainWindow(QMainWindow):
                 border-top-right-radius: 8px;
                 font-weight: 600;
             }
-
             QTabBar::tab:hover {
                 background-color: #1a2945;
                 color: #dbeafe;
@@ -1198,7 +1295,6 @@ class MainWindow(QMainWindow):
                 color: #ffffff;
                 border-top: 2px solid #38bdf8;
             }
-
             QPushButton {
                 background-color: #1e3a5f;
                 color: #eff6ff;
@@ -1216,13 +1312,11 @@ class MainWindow(QMainWindow):
             QPushButton:pressed {
                 background-color: #172f50;
             }
-
             QPushButton:disabled {
                 background-color: #172033;
                 border-color: #2a3448;
                 color: #64748b;
             }
-
             QComboBox,
             QDateEdit,
             QLineEdit,
@@ -1236,7 +1330,6 @@ class MainWindow(QMainWindow):
                 selection-background-color: #2563eb;
                 selection-color: #ffffff;
             }
-
             QComboBox:hover,
             QDateEdit:hover,
             QLineEdit:hover {
@@ -1248,7 +1341,6 @@ class MainWindow(QMainWindow):
                 border: none;
                 width: 22px;
             }
-
             QTableWidget {
                 background-color: #0f192b;
                 alternate-background-color: #121f35;
@@ -1259,7 +1351,6 @@ class MainWindow(QMainWindow):
                 selection-background-color: #244e85;
                 selection-color: #ffffff;
             }
-
             QHeaderView::section {
                 background-color: #1b2a46;
                 color: #bfe3ff;
@@ -1274,7 +1365,6 @@ class MainWindow(QMainWindow):
                 spacing: 7px;
                 padding: 2px 3px;
             }
-
             QCheckBox::indicator {
                 width: 16px;
                 height: 16px;
@@ -1287,7 +1377,6 @@ class MainWindow(QMainWindow):
                 background: #2563eb;
                 border-color: #60a5fa;
             }
-
             QProgressBar {
                 background-color: #111c30;
                 color: #f8fafc;
@@ -1300,7 +1389,6 @@ class MainWindow(QMainWindow):
                 background-color: #22c55e;
                 border-radius: 5px;
             }
-
             QStatusBar {
                 background-color: #0d1728;
                 color: #9fb2cf;
@@ -1345,7 +1433,6 @@ class MainWindow(QMainWindow):
         a_file.triggered.connect(
             self.choose_file
         )
-
         a_folder.triggered.connect(
             self.choose_folder
         )
@@ -1372,8 +1459,21 @@ class MainWindow(QMainWindow):
             1,
         )
 
+        self.rakeback_button = QPushButton(
+            "Add/Edit Rakeback"
+        )
+        self.rakeback_button.setToolTip(
+            "Enter manual rakeback for a cash-game stake"
+        )
+        self.rakeback_button.clicked.connect(
+            self.edit_rakeback
+        )
+        top.addWidget(
+            self.rakeback_button
+        )
+
         self.customize_cards_button = QPushButton(
-            "Customize cards…"
+            "Customize cards"
         )
 
         self.customize_cards_button.setToolTip(
@@ -1388,10 +1488,10 @@ class MainWindow(QMainWindow):
             self.customize_cards_button
         )
 
+
         outer.addLayout(top)
 
         self.card_grid = QGridLayout()
-
         self.cards = {
             title: StatCard(title)
             for title in OVERVIEW_CARD_TITLES
@@ -1414,12 +1514,16 @@ class MainWindow(QMainWindow):
         )
 
         self.graph_checks = {}
-
         graph_options = [
             (
                 "net",
-                "Net won",
+                "Net Won",
                 "#2ecc71",
+            ),
+            (
+                "net_post_rb",
+                "Net Won post RB",
+                "#CB00F5",
             ),
             (
                 "showdown",
@@ -1437,9 +1541,14 @@ class MainWindow(QMainWindow):
                 "#e74c3c",
             ),
         ]
-
         for key, label, color in graph_options:
             checkbox = QCheckBox(label)
+            if key == "net_post_rb":
+                checkbox.setToolTip(
+                    "Net Won plus manual rakeback. Because rakeback is stored "
+                    "as a cumulative amount, it is spread evenly across the "
+                    "displayed hands for graphing."
+                )
 
             stored = self.settings.value(
                 f"overview/graph/{key}",
@@ -1455,7 +1564,6 @@ class MainWindow(QMainWindow):
                 }
             else:
                 checked = bool(stored)
-
             checkbox.setChecked(
                 checked
             )
@@ -1476,7 +1584,6 @@ class MainWindow(QMainWindow):
             )
 
             self.graph_checks[key] = checkbox
-
             graph_controls.addWidget(
                 checkbox
             )
@@ -1499,7 +1606,6 @@ class MainWindow(QMainWindow):
             self.graph,
             1,
         )
-
         # Subtle optional support link in the bottom-right
         # of the Overview tab.
         # Optional support button in the bottom-right of the Overview tab.
@@ -1510,7 +1616,6 @@ class MainWindow(QMainWindow):
         self.support_button.setToolTip(
             "Support the development of CoinPoker Tracker"
         )
-
         self.support_button.setStyleSheet(
             """
             QPushButton {
@@ -1526,7 +1631,6 @@ class MainWindow(QMainWindow):
                 background-color: #36527d;
                 border-color: #bae6fd;
             }
-
             QPushButton:pressed {
                 background-color: #22344f;
             }
@@ -1565,7 +1669,6 @@ class MainWindow(QMainWindow):
                 if raw_order
                 else []
             )
-
         except (
             TypeError,
             ValueError,
@@ -1588,7 +1691,6 @@ class MainWindow(QMainWindow):
                 and title not in order
             ):
                 order.append(title)
-
         for title in OVERVIEW_CARD_TITLES:
             if title not in order:
                 order.append(title)
@@ -1604,7 +1706,6 @@ class MainWindow(QMainWindow):
                 if raw_hidden
                 else []
             )
-
         except (
             TypeError,
             ValueError,
@@ -1664,7 +1765,6 @@ class MainWindow(QMainWindow):
                 continue
 
             card.show()
-
             self.card_grid.addWidget(
                 card,
                 visible_index // 5,
@@ -1685,7 +1785,6 @@ class MainWindow(QMainWindow):
             self.hidden_cards,
             self,
         )
-
         if (
             dialog.exec()
             != QDialog.Accepted
@@ -1700,6 +1799,29 @@ class MainWindow(QMainWindow):
         self._save_overview_card_layout()
         self._apply_overview_card_layout()
 
+    def edit_rakeback(self):
+        selected_bb_cents = None
+        if hasattr(self, "filters"):
+            selected_bb_cents = self.filters.filters().get(
+                "bb_cents"
+            )
+
+        dialog = RakebackDialog(
+            self.db,
+            selected_bb_cents,
+            self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        sb_cents, bb_cents, cents = dialog.saved_value()
+        self.statusBar().showMessage(
+            f"Saved {fmt_money(cents)} rakeback for "
+            f"{fmt_money(sb_cents)}/{fmt_money(bb_cents)}.",
+            5000,
+        )
+        self.refresh_all()
+
     def _graph_visibility_changed(
         self,
         key: str,
@@ -1709,7 +1831,6 @@ class MainWindow(QMainWindow):
             f"overview/graph/{key}",
             checked,
         )
-
         self.settings.sync()
 
         if hasattr(
@@ -1730,7 +1851,6 @@ class MainWindow(QMainWindow):
         self.delete_hands_button = QPushButton(
             "Delete selected hand(s)"
         )
-
         self.delete_hands_button.setToolTip(
             "Delete the selected hands from this tracker database"
         )
@@ -1754,7 +1874,6 @@ class MainWindow(QMainWindow):
             0,
             13,
         )
-
         self.hand_table.setHorizontalHeaderLabels(
             [
                 "Date",
@@ -1767,7 +1886,7 @@ class MainWindow(QMainWindow):
                 "Splash",
                 "Splash won",
                 "Pot",
-                "Net",
+                "Net Won",
                 "AI Eq",
                 "AI Adj BB",
             ]
@@ -1777,7 +1896,6 @@ class MainWindow(QMainWindow):
             self.hand_table
             .horizontalHeader()
         )
-
         header.setSectionResizeMode(
             QHeaderView.ResizeToContents
         )
@@ -1798,7 +1916,6 @@ class MainWindow(QMainWindow):
         header.sectionClicked.connect(
             self._sort_hands_by_column
         )
-
         self._hand_sort_column = 0
         self._hand_sort_order = (
             Qt.DescendingOrder
@@ -1820,7 +1937,6 @@ class MainWindow(QMainWindow):
         self.hand_table.setSelectionMode(
             QAbstractItemView.ExtendedSelection
         )
-
         self.hand_table.setEditTriggers(
             QTableWidget.NoEditTriggers
         )
@@ -1842,7 +1958,6 @@ class MainWindow(QMainWindow):
         self.hand_table.itemSelectionChanged.connect(
             self.show_selected_hand
         )
-
         self.raw = QPlainTextEdit()
         self.raw.setReadOnly(True)
 
@@ -1889,7 +2004,6 @@ class MainWindow(QMainWindow):
         self.delete_sessions_button.clicked.connect(
             self.delete_selected_sessions
         )
-
         toolbar.addWidget(
             self.delete_sessions_button
         )
@@ -1909,11 +2023,10 @@ class MainWindow(QMainWindow):
                 "End",
                 "Duration",
                 "Hands",
-                "Net",
+                "Net Won",
                 "BB won",
             ]
         )
-
         self.session_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.Stretch
         )
@@ -1933,7 +2046,6 @@ class MainWindow(QMainWindow):
         self.session_table.setEditTriggers(
             QTableWidget.NoEditTriggers
         )
-
         self._session_rows = []
 
         lay.addWidget(
@@ -1953,12 +2065,11 @@ class MainWindow(QMainWindow):
             0,
             6,
         )
-
         self.pos_table.setHorizontalHeaderLabels(
             [
                 "Position",
                 "Hands",
-                "Net",
+                "Net Won",
                 "bb/100",
                 "VPIP",
                 "PFR",
@@ -1976,7 +2087,6 @@ class MainWindow(QMainWindow):
         self.pos_table.setEditTriggers(
             QTableWidget.NoEditTriggers
         )
-
         lay.addWidget(
             self.pos_table
         )
@@ -2031,7 +2141,6 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Counting hands in {target}…"
         )
-
         self.import_progress.setRange(
             0,
             0,
@@ -2053,7 +2162,6 @@ class MainWindow(QMainWindow):
         self.worker.progress_changed.connect(
             self.import_progress_changed
         )
-
         self.worker.finished_import.connect(
             self.import_finished
         )
@@ -2075,7 +2183,6 @@ class MainWindow(QMainWindow):
                 0,
                 total,
             )
-
             self.import_progress.setValue(
                 min(
                     current,
@@ -2092,7 +2199,6 @@ class MainWindow(QMainWindow):
                 f"Importing {filename} — "
                 f"hand {current:,}/{total:,}"
             )
-
         else:
             self.import_progress.setRange(
                 0,
@@ -2114,7 +2220,6 @@ class MainWindow(QMainWindow):
         errors: list,
     ):
         self.import_progress.hide()
-
         self.statusBar().showMessage(
             f"Imported {added} new hands; "
             f"{duplicates} duplicates.",
@@ -2124,9 +2229,7 @@ class MainWindow(QMainWindow):
         self.filters.refresh_stakes(
             self.db
         )
-
         self.refresh_all()
-
         if errors:
             QMessageBox.warning(
                 self,
@@ -2146,7 +2249,6 @@ class MainWindow(QMainWindow):
         message: str,
     ):
         self.import_progress.hide()
-
         self.statusBar().showMessage(
             "Import failed",
             10000,
@@ -2172,14 +2274,23 @@ class MainWindow(QMainWindow):
 
         vals = {
             "Hands": f"{o['hands']:,}",
-            "Net": fmt_money(
+            "Net Won": fmt_money(
                 o["net_cents"]
+            ),
+            "Rakeback Amount": fmt_money(
+                o["rakeback_cents"]
+            ),
+            "Net Won post RB": fmt_money(
+                o["net_post_rb_cents"]
             ),
             "Splash won": fmt_money(
                 o["splash_won_cents"]
             ),
             "bb/100": (
                 f"{o['bb100']:.2f}"
+            ),
+            "bb/100 post RB": (
+                f"{o['bb100_post_rb']:.2f}"
             ),
             "All-in Adj Net Won": fmt_money(
                 o["allin_adj_cents"]
@@ -2218,7 +2329,6 @@ class MainWindow(QMainWindow):
                 f"{o['multi_run_hands']:,}"
             ),
         }
-
         for k, v in vals.items():
             self.cards[k].value.setText(v)
 
@@ -2231,6 +2341,30 @@ class MainWindow(QMainWindow):
             for r in graph_rows
         ]
 
+        # Rakeback is stored as one cumulative manual amount rather than
+        # timestamped per hand. For the graph, spread the selected total evenly
+        # across the displayed hands so the post-RB line starts at zero and its
+        # final point exactly represents Net Won + Rakeback Amount.
+        if net_changes:
+            rakeback_total = int(o["rakeback_cents"])
+            base_rb, extra_cents = divmod(
+                rakeback_total,
+                len(net_changes),
+            )
+            rakeback_changes = [
+                float(base_rb + (1 if i < extra_cents else 0))
+                for i in range(len(net_changes))
+            ]
+            net_post_rb_changes = [
+                net_change + rb_change
+                for net_change, rb_change in zip(
+                    net_changes,
+                    rakeback_changes,
+                )
+            ]
+        else:
+            net_post_rb_changes = []
+
         showdown_changes = [
             (
                 float(
@@ -2241,7 +2375,6 @@ class MainWindow(QMainWindow):
             )
             for r in graph_rows
         ]
-
         nonshowdown_changes = [
             (
                 0.0
@@ -2259,9 +2392,9 @@ class MainWindow(QMainWindow):
             )
             for r in graph_rows
         ]
-
         self.graph.set_series_changes(
             net=net_changes,
+            net_post_rb=net_post_rb_changes,
             showdown=showdown_changes,
             allin_adj=allin_adj_changes,
             nonshowdown=nonshowdown_changes,
@@ -2288,7 +2421,6 @@ class MainWindow(QMainWindow):
             11,
             12,
         }
-
         if column == self._hand_sort_column:
             self._hand_sort_order = (
                 Qt.AscendingOrder
@@ -2305,7 +2437,6 @@ class MainWindow(QMainWindow):
                 if column in descending_first
                 else Qt.AscendingOrder
             )
-
         self.hand_table.horizontalHeader().setSortIndicator(
             column,
             self._hand_sort_order,
@@ -2328,7 +2459,6 @@ class MainWindow(QMainWindow):
             hand_no = int(
                 r["hand_id"]
             )
-
         except (
             TypeError,
             ValueError,
@@ -2336,7 +2466,6 @@ class MainWindow(QMainWindow):
             hand_no = str(
                 r["hand_id"]
             )
-
         return [
             r["started_at"],
             hand_no,
@@ -2423,7 +2552,6 @@ class MainWindow(QMainWindow):
                 ]
                 if x
             )
-
             vals = [
                 r["started_at"][:19],
                 r["hand_id"],
@@ -2492,14 +2620,12 @@ class MainWindow(QMainWindow):
                     else ""
                 ),
             ]
-
             sort_values = (
                 self._hand_sort_values(
                     r,
                     boards,
                 )
             )
-
             for j, (
                 value,
                 sort_value,
@@ -2517,7 +2643,6 @@ class MainWindow(QMainWindow):
                         sort_value,
                     ),
                 )
-
         if rows:
             self.hand_table.sortItems(
                 self._hand_sort_column,
@@ -2536,7 +2661,6 @@ class MainWindow(QMainWindow):
 
     def show_selected_hand(self):
         row = self.hand_table.currentRow()
-
         if row < 0:
             return
 
@@ -2574,7 +2698,6 @@ class MainWindow(QMainWindow):
             )
             is not None
         ]
-
         if not hand_ids:
             QMessageBox.information(
                 self,
@@ -2592,7 +2715,6 @@ class MainWindow(QMainWindow):
                 f"{len(hand_ids)} "
                 f"selected hands"
             )
-
         answer = QMessageBox.question(
             self,
             "Delete hands",
@@ -2605,7 +2727,6 @@ class MainWindow(QMainWindow):
             | QMessageBox.No,
             QMessageBox.No,
         )
-
         if answer != QMessageBox.Yes:
             return
 
@@ -2618,7 +2739,6 @@ class MainWindow(QMainWindow):
         self.filters.refresh_stakes(
             self.db
         )
-
         self.refresh_all()
 
         self.statusBar().showMessage(
@@ -2641,7 +2761,6 @@ class MainWindow(QMainWindow):
         self.session_table.setRowCount(
             len(rows)
         )
-
         for i, r in enumerate(rows):
             minutes = max(
                 0,
@@ -2653,7 +2772,6 @@ class MainWindow(QMainWindow):
                     / 60
                 ),
             )
-
             vals = [
                 r["start"].strftime(
                     "%Y-%m-%d %H:%M"
@@ -2673,7 +2791,6 @@ class MainWindow(QMainWindow):
                 ),
                 f"{r['net_bb']:.1f}",
             ]
-
             for j, v in enumerate(vals):
                 self.session_table.setItem(
                     i,
@@ -2691,7 +2808,6 @@ class MainWindow(QMainWindow):
                 .selectedRows()
             }
         )
-
         selected_sessions = [
             self._session_rows[row]
             for row in rows
@@ -2709,7 +2825,6 @@ class MainWindow(QMainWindow):
                 "Select one or more sessions first.",
             )
             return
-
         hand_ids = list(
             dict.fromkeys(
                 hand_id
@@ -2722,7 +2837,6 @@ class MainWindow(QMainWindow):
                 )
             )
         )
-
         if not hand_ids:
             QMessageBox.information(
                 self,
@@ -2734,7 +2848,6 @@ class MainWindow(QMainWindow):
         session_count = len(
             selected_sessions
         )
-
         answer = QMessageBox.question(
             self,
             "Delete sessions",
@@ -2750,7 +2863,6 @@ class MainWindow(QMainWindow):
             | QMessageBox.No,
             QMessageBox.No,
         )
-
         if answer != QMessageBox.Yes:
             return
 
@@ -2763,7 +2875,6 @@ class MainWindow(QMainWindow):
         self.filters.refresh_stakes(
             self.db
         )
-
         self.refresh_all()
 
         self.statusBar().showMessage(
@@ -2789,7 +2900,6 @@ class MainWindow(QMainWindow):
             netbb = float(
                 r["net_bb"] or 0
             )
-
             vals = [
                 r["position"]
                 or "—",
@@ -2808,7 +2918,6 @@ class MainWindow(QMainWindow):
                     f"{((r['pfr_n'] or 0) * 100 / h if h else 0):.1f}%"
                 ),
             ]
-
             for j, v in enumerate(vals):
                 self.pos_table.setItem(
                     i,
