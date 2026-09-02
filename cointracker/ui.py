@@ -7,9 +7,9 @@ from pathlib import Path
 from PySide6.QtCore import QDate, QSettings, Qt, Signal, QThread
 from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateEdit, QDialog,
+    QAbstractItemView, QApplication, QCalendarWidget, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
-    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
+    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
     QPushButton, QSplitter, QStyledItemDelegate, QStyle, QStyleOptionViewItem, QTabWidget, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget
 )
@@ -117,6 +117,12 @@ class OverviewCardsDialog(QDialog):
         self.list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.list.setDragDropMode(QAbstractItemView.InternalMove)
         self.list.setDefaultDropAction(Qt.MoveAction)
+        # This list is a pure reorder control.  Explicitly disable overwrite
+        # semantics and let the list/viewport accept drops between rows.
+        # Individual cards must not be drop targets; dropping *on* a card can
+        # otherwise make Qt treat the destination row as replaceable.
+        self.list.setDragDropOverwriteMode(False)
+        self.list.viewport().setAcceptDrops(True)
         self.list.setDropIndicatorShown(True)
         lay.addWidget(self.list, 1)
 
@@ -136,10 +142,12 @@ class OverviewCardsDialog(QDialog):
         for title in order:
             item = QListWidgetItem(title)
             item.setFlags(
-                item.flags()
-                | Qt.ItemIsUserCheckable
-                | Qt.ItemIsDragEnabled
-                | Qt.ItemIsDropEnabled
+                (
+                    item.flags()
+                    | Qt.ItemIsUserCheckable
+                    | Qt.ItemIsDragEnabled
+                )
+                & ~Qt.ItemIsDropEnabled
             )
             item.setCheckState(Qt.Unchecked if title in hidden else Qt.Checked)
             self.list.addItem(item)
@@ -148,14 +156,24 @@ class OverviewCardsDialog(QDialog):
         self._populate(list(OVERVIEW_CARD_TITLES), set())
 
     def layout_state(self) -> tuple[list[str], set[str]]:
+        # Sanitize before saving so a malformed drag/drop can never persist a
+        # missing or duplicate card into QSettings.
+        known = set(OVERVIEW_CARD_TITLES)
         order = []
         hidden = set()
         for row in range(self.list.count()):
             item = self.list.item(row)
             title = item.text()
+            if title not in known or title in order:
+                continue
             order.append(title)
             if item.checkState() != Qt.Checked:
                 hidden.add(title)
+
+        for title in OVERVIEW_CARD_TITLES:
+            if title not in order:
+                order.append(title)
+
         return order, hidden
 
 
@@ -413,6 +431,131 @@ class ImportWorker(QThread):
             db.close()
 
 
+class ClickableDateField(QLineEdit):
+    """Read-only date display that opens its calendar when clicked."""
+
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        super().mousePressEvent(event)
+        self.clicked.emit()
+
+
+class OptionalDatePicker(QWidget):
+    """Date picker with a real empty/Any state and an explicit dropdown button."""
+
+    dateChanged = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._date = None
+        self._popup = None
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self.field = ClickableDateField()
+        self.field.setText("Any")
+        self.field.setMinimumWidth(110)
+        self.field.setToolTip("Click to choose a date")
+        self.field.clicked.connect(self.show_calendar)
+        self.field.setStyleSheet(
+            """
+            QLineEdit {
+                border-top-right-radius: 0;
+                border-bottom-right-radius: 0;
+                padding-right: 6px;
+            }
+            """
+        )
+
+        self.drop_button = QPushButton("▼")
+        self.drop_button.setFixedWidth(30)
+        self.drop_button.setToolTip("Open calendar")
+        self.drop_button.setFocusPolicy(Qt.NoFocus)
+        self.drop_button.clicked.connect(self.show_calendar)
+        self.drop_button.setStyleSheet(
+            """
+            QPushButton {
+                border-top-left-radius: 0;
+                border-bottom-left-radius: 0;
+                padding: 5px 4px;
+                font-size: 9pt;
+            }
+            """
+        )
+
+        lay.addWidget(self.field, 1)
+        lay.addWidget(self.drop_button)
+
+    def has_date(self) -> bool:
+        return self._date is not None and self._date.isValid()
+
+    def date(self) -> QDate:
+        return QDate(self._date) if self.has_date() else QDate()
+
+    def setDate(self, date: QDate):
+        if date is None or not date.isValid():
+            self.clearDate()
+            return
+
+        changed = not self.has_date() or self._date != date
+        self._date = QDate(date)
+        self.field.setText(self._date.toString("M/d/yyyy"))
+        if changed:
+            self.dateChanged.emit()
+
+    def clearDate(self):
+        changed = self.has_date()
+        self._date = None
+        self.field.setText("Any")
+        if changed:
+            self.dateChanged.emit()
+
+    def show_calendar(self):
+        # With no date filter selected, open on today's actual date.
+        selected = self._date if self.has_date() else QDate.currentDate()
+
+        popup = QFrame(self, Qt.Popup)
+        popup.setObjectName("dateCalendarPopup")
+        popup.setStyleSheet(
+            """
+            QFrame#dateCalendarPopup {
+                background-color: #111c30;
+                border: 1px solid #38bdf8;
+                border-radius: 7px;
+            }
+            """
+        )
+
+        popup_layout = QVBoxLayout(popup)
+        popup_layout.setContentsMargins(4, 4, 4, 4)
+
+        calendar = QCalendarWidget(popup)
+        calendar.setGridVisible(False)
+        calendar.setSelectedDate(selected)
+        calendar.setCurrentPage(selected.year(), selected.month())
+        popup_layout.addWidget(calendar)
+
+        def choose_date(date: QDate):
+            self.setDate(date)
+            popup.close()
+
+        calendar.clicked.connect(choose_date)
+
+        self._popup = popup
+        popup.adjustSize()
+        popup.move(self.mapToGlobal(self.rect().bottomLeft()))
+        popup.show()
+        calendar.setFocus()
+
+
 class FiltersBar(QWidget):
     changed = Signal()
 
@@ -420,27 +563,56 @@ class FiltersBar(QWidget):
         super().__init__()
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        self.date_from = QDateEdit(calendarPopup=True)
-        self.date_to = QDateEdit(calendarPopup=True)
-        self.date_from.setSpecialValueText("Any")
-        self.date_to.setSpecialValueText("Any")
-        self.date_from.setMinimumDate(QDate(2000,1,1))
-        self.date_to.setMinimumDate(QDate(2000,1,1))
-        today = QDate.currentDate()
-        self.date_from.setDate(today)
-        self.date_to.setDate(today)
+
+        # None means "Any". No fake/sentinel date is used.
+        self.date_from = OptionalDatePicker()
+        self.date_to = OptionalDatePicker()
+
+        self.today_button = QPushButton("Today")
+        self.today_button.setToolTip("Show hands played today")
+        self.today_button.clicked.connect(self.show_today)
+
+        self.all_dates_button = QPushButton("All Dates")
+        self.all_dates_button.setToolTip("Show hands from all dates")
+        self.all_dates_button.clicked.connect(self.show_all_dates)
+
         self.stakes = QComboBox()
         self.splash = QComboBox(); self.splash.addItems(["All pots", "Splash only", "Exclude splash"])
         self.runs = QComboBox(); self.runs.addItems(["All runouts", "Run once", "Run it 2x/3x"])
-        for w in [self.date_from, self.date_to, self.stakes, self.splash, self.runs]:
-            if isinstance(w, QComboBox): w.currentIndexChanged.connect(self.changed)
-            else: w.dateChanged.connect(self.changed)
+
+        self.date_from.dateChanged.connect(self.changed.emit)
+        self.date_to.dateChanged.connect(self.changed.emit)
+        self.stakes.currentIndexChanged.connect(self.changed.emit)
+        self.splash.currentIndexChanged.connect(self.changed.emit)
+        self.runs.currentIndexChanged.connect(self.changed.emit)
+
         lay.addWidget(QLabel("From")); lay.addWidget(self.date_from)
         lay.addWidget(QLabel("To")); lay.addWidget(self.date_to)
+        lay.addWidget(self.today_button)
+        lay.addWidget(self.all_dates_button)
         lay.addWidget(QLabel("Stakes")); lay.addWidget(self.stakes)
         lay.addWidget(self.splash); lay.addWidget(self.runs)
         lay.addStretch(1)
         self.refresh_stakes(db)
+
+    def show_today(self):
+        today = QDate.currentDate()
+        self.date_from.blockSignals(True)
+        self.date_to.blockSignals(True)
+        self.date_from.setDate(today)
+        self.date_to.setDate(today)
+        self.date_from.blockSignals(False)
+        self.date_to.blockSignals(False)
+        self.changed.emit()
+
+    def show_all_dates(self):
+        self.date_from.blockSignals(True)
+        self.date_to.blockSignals(True)
+        self.date_from.clearDate()
+        self.date_to.clearDate()
+        self.date_from.blockSignals(False)
+        self.date_to.blockSignals(False)
+        self.changed.emit()
 
     def refresh_stakes(self, db: TrackerDB):
         old = self.stakes.currentData()
@@ -450,14 +622,15 @@ class FiltersBar(QWidget):
         for sb, bb in db.distinct_stakes():
             self.stakes.addItem(f"{fmt_money(sb)}/{fmt_money(bb)}", bb)
         idx = self.stakes.findData(old)
-        if idx >= 0: self.stakes.setCurrentIndex(idx)
+        if idx >= 0:
+            self.stakes.setCurrentIndex(idx)
         self.stakes.blockSignals(False)
 
     def filters(self) -> dict:
         f = {}
-        if self.date_from.date() != self.date_from.minimumDate():
+        if self.date_from.has_date():
             f["date_from"] = self.date_from.date().toString("yyyy-MM-dd")
-        if self.date_to.date() != self.date_to.minimumDate():
+        if self.date_to.has_date():
             f["date_to"] = self.date_to.date().toString("yyyy-MM-dd")
         if self.stakes.currentData() is not None:
             f["bb_cents"] = int(self.stakes.currentData())
@@ -474,7 +647,7 @@ class MainWindow(QMainWindow):
         self.settings = QSettings("OpenAI", "CoinPokerTracker")
         self.hero_name = self.settings.value("hero_name", "Hero")
         self.worker = None
-        self.setWindowTitle("CoinPoker Tracker v0.20")
+        self.setWindowTitle("CoinPoker Tracker v1.0")
         self.resize(1280, 800)
         self._apply_theme()
 
