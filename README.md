@@ -16,7 +16,7 @@ Open the latest release and download:
 
 `CoinPokerTracker-Setup.exe`
 
-> **Windows SmartScreen:** The installer may currently show an "unrecognized app" warning because the application is not code-signed. You will need to click "More Info" and choose **Run anyway**.
+> **Windows SmartScreen:** The installer may currently show an "unrecognized app" warning because the application as it builds reputation. You will need to click "More Info" and choose **Run anyway**.
 
 ## What it does
 
