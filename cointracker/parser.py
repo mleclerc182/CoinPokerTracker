@@ -12,7 +12,6 @@ from .equity import exact_equities, estimate_equities_with_unknown
 
 MONEY_SCALE = Decimal("100")
 
-
 def money_to_cents(value: str | Decimal | None) -> int:
     if value is None or value == "":
         return 0
@@ -23,17 +22,16 @@ def money_to_cents(value: str | Decimal | None) -> int:
 def cents_to_money(cents: int) -> Decimal:
     return Decimal(cents) / MONEY_SCALE
 
-
 HEADER_RE = re.compile(
     r"^CoinPoker Hand #(?P<id>\d+):\s+(?P<game>[^\s]+)\s+"
-    r"\(₮(?P<sb>[\d.]+)/₮(?P<bb>[\d.]+)\)\s+"
+    r"\(₮(?P<sb>[\d.]+)/₮(?P<bb>[\d.]+)(?:/₮(?P<ante>[\d.]+))?\)\s+"
     r"(?P<date>\d{4}/\d{2}/\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2})\s+(?P<tz>\S+)\s*$"
 )
 TABLE_RE = re.compile(r"^Table '([^']+)'\s+(\d+)-max Seat #(\d+) is the button$")
 SEAT_RE = re.compile(r"^Seat (\d+):\s+(.+?)\s+\(₮([\d.]+) in chips\)$")
 DEALT_RE = re.compile(r"^Dealt to (.+?)(?: \[([^\]]+)\])?$")
 SPLASH_RE = re.compile(r"^(MEGA SPLASH|SPLASH) dropped ₮([\d.]+)$")
-POST_RE = re.compile(r"^(.+?): posts (small blind|big blind|auto big blind) ₮([\d.]+)$")
+POST_RE = re.compile(r"^(.+?): posts (ante|small blind|big blind|auto big blind) ₮([\d.]+)$")
 STRADDLE_RE = re.compile(r"^(.+?): STRADDLE ₮([\d.]+)$")
 RAISE_RE = re.compile(r"^(.+?): raises ₮([\d.]+) to ₮([\d.]+)$")
 CALL_RE = re.compile(r"^(.+?): calls ₮([\d.]+)$")
@@ -45,13 +43,12 @@ CHECK_RE = re.compile(r"^(.+?): checks$")
 SHOW_RE = re.compile(r"^(.+?): shows \[([^\]]+)\](?: \(([^)]+)\))?$")
 MUCK_RE = re.compile(r"^(.+?): mucks hand$")
 COLLECT_RE = re.compile(r"^(.+?) collected ₮([\d.]+) from pot$")
-TOTAL_RE = re.compile(r"^Total pot ₮([\d.]+) \| Rake ₮([\d.]+)$")
+TOTAL_RE = re.compile(r"^Total pot ₮([\d.]+) \| Rake ₮([\d.]+)(?: \| Splash Fee ₮([\d.]+))?$")
 RUN_RE = re.compile(r"^Hand was run (once|two times|three times)$")
 BOARD_RE = re.compile(r"^(?:(FIRST|SECOND|THIRD) )?Board \[\s*([^\]]*?)\s*\]$")
 END_RE = re.compile(r"^Game ended: (\d{4}/\d{2}/\d{2}) (\d{2}:\d{2}:\d{2}) (\S+)$")
 STREET_RE = re.compile(r"^\*\*\* (?:(FIRST|SECOND|THIRD) )?(FLOP|TURN|RIVER) \*\*\*")
 SHOWDOWN_MARKER_RE = re.compile(r"^\*\*\* (?:(FIRST|SECOND|THIRD) )?SHOWDOWN \*\*\*$")
-
 RUN_MAP = {"once": 1, "two times": 2, "three times": 3}
 RUN_WORD = {None: 1, "FIRST": 1, "SECOND": 2, "THIRD": 3}
 
@@ -77,7 +74,6 @@ class Action:
     aggressive: bool = False
     raise_number: int = 0
 
-
 @dataclass(slots=True)
 class PlayerResult:
     player: str
@@ -101,7 +97,6 @@ class PlayerResult:
     went_to_showdown: bool = False
     won_showdown: bool = False
     folded_preflop: bool = False
-
 
 @dataclass(slots=True)
 class Hand:
@@ -127,11 +122,11 @@ class Hand:
     splash_cents: int = 0
     total_pot_cents: int = 0
     rake_cents: int = 0
+    splash_fee_cents: int = 0
     player_results: dict[str, PlayerResult] = field(default_factory=dict)
     raw_text: str = ""
     first_allin_street: str = ""
     first_allin_board: str = ""
-
     @property
     def hero_result(self) -> PlayerResult:
         return self.player_results.get(self.hero_name, PlayerResult(self.hero_name))
@@ -146,13 +141,11 @@ class Hand:
 
 
 CARD_RANK = {r: i for i, r in enumerate("23456789TJQKA", start=2)}
-
 def _rank_five(cards: tuple[str, ...]) -> tuple[int, ...]:
     """Return a comparable Hold'em five-card rank; larger tuples are better."""
     values = sorted((CARD_RANK[c[0]] for c in cards), reverse=True)
     suits = [c[1] for c in cards]
     counts = Counter(values)
-
     unique = sorted(set(values), reverse=True)
     if 14 in unique:
         unique.append(1)  # wheel support
@@ -166,13 +159,11 @@ def _rank_five(cards: tuple[str, ...]) -> tuple[int, ...]:
 
     if straight_high and flush:
         return (8, straight_high)
-
     quads = sorted((v for v, n in counts.items() if n == 4), reverse=True)
     if quads:
         q = quads[0]
         kicker = max(v for v in values if v != q)
         return (7, q, kicker)
-
     trips = sorted((v for v, n in counts.items() if n == 3), reverse=True)
     pairs_or_better = sorted((v for v, n in counts.items() if n >= 2), reverse=True)
     if trips:
@@ -180,7 +171,6 @@ def _rank_five(cards: tuple[str, ...]) -> tuple[int, ...]:
         pair_choices = [v for v in pairs_or_better if v != t]
         if pair_choices:
             return (6, t, pair_choices[0])
-
     if flush:
         return (5, *values)
     if straight_high:
@@ -189,7 +179,6 @@ def _rank_five(cards: tuple[str, ...]) -> tuple[int, ...]:
         t = trips[0]
         kickers = sorted((v for v in values if v != t), reverse=True)[:2]
         return (3, t, *kickers)
-
     pairs = sorted((v for v, n in counts.items() if n == 2), reverse=True)
     if len(pairs) >= 2:
         hi, lo = pairs[:2]
@@ -201,13 +190,11 @@ def _rank_five(cards: tuple[str, ...]) -> tuple[int, ...]:
         return (1, pair, *kickers)
     return (0, *values)
 
-
 def _holdem_rank(hole_cards: str, board: str) -> tuple[int, ...] | None:
     cards = hole_cards.split() + board.split()
     if len(cards) != 7 or any(len(c) != 2 or c[0] not in CARD_RANK for c in cards):
         return None
     return max(_rank_five(combo) for combo in combinations(cards, 5))
-
 
 def _odd_chip_order(hand: Hand, players: list[str]) -> list[str]:
     """Poker odd-chip order: first occupied seat clockwise after the button."""
@@ -220,14 +207,12 @@ def _odd_chip_order(hand: Hand, players: list[str]) -> list[str]:
     order_index = {seat: i for i, seat in enumerate(clockwise)}
     return sorted(players, key=lambda p: (order_index.get(by_player.get(p, -1), 999), p))
 
-
 def _split_cents(amount: int, winners: list[str], hand: Hand) -> dict[str, int]:
     if amount <= 0 or not winners:
         return {}
     ordered = _odd_chip_order(hand, winners)
     base, rem = divmod(amount, len(ordered))
     return {p: base + (1 if i < rem else 0) for i, p in enumerate(ordered)}
-
 
 def _splash_awards(
     hand: Hand,
@@ -237,7 +222,6 @@ def _splash_awards(
     mucked_players: set[str],
 ) -> dict[str, int]:
     """Allocate CoinPoker Splash/Mega Splash money to main-pot winner(s).
-
     CoinPoker includes the promotional drop in ``Total pot`` but does not include
     that award in the normal ``collected`` lines. The drop belongs to the main pot,
     so side-pot-only winners receive none. For RIT/RIT3 the drop is divided across
@@ -245,7 +229,6 @@ def _splash_awards(
     """
     if hand.splash_cents <= 0:
         return {}
-
     active = [
         p for p, r in results.items()
         if p not in folded_players
@@ -255,7 +238,6 @@ def _splash_awards(
         return {}
     if len(active) == 1:
         return {active[0]: hand.splash_cents}
-
     # Split the promotional pot between runouts first. Earlier runouts receive an
     # odd cent if the splash amount is not evenly divisible.
     run_count = max(1, hand.run_count)
@@ -265,7 +247,6 @@ def _splash_awards(
     for run_idx in range(1, run_count + 1):
         run_amount = run_base + (1 if run_idx <= run_rem else 0)
         board = hand.boards[run_idx - 1] if run_idx - 1 < len(hand.boards) else ""
-
         ranks: dict[str, tuple[int, ...]] = {}
         unresolved: list[str] = []
         for player in active:
@@ -277,7 +258,6 @@ def _splash_awards(
                 ranks[player] = rank
             else:
                 unresolved.append(player)
-
         winners: list[str] = []
         if ranks and not unresolved:
             best = max(ranks.values())
@@ -291,7 +271,6 @@ def _splash_awards(
             ]
             if collectors:
                 winners = [collectors[0]]
-
         for player, cents in _split_cents(run_amount, winners, hand).items():
             awards[player] = awards.get(player, 0) + cents
 
@@ -305,7 +284,6 @@ _VOLUNTARY_MONEY_ACTIONS = {"CALL", "BET", "RAISE", "ALLIN"}
 
 def _rit_dead_sets(hand: Hand, base_board: str) -> list[tuple[str, ...]]:
     """Dead-card sets for sequential CoinPoker RIT/RIT+1 runouts.
-
     CoinPoker deals multiple runouts from one physical remaining deck.  The first
     run uses the deck as it stood at the all-in; cards consumed by that completed
     run are unavailable to the second, and so on.  Shared cards already present
@@ -325,10 +303,8 @@ def _rit_dead_sets(hand: Hand, base_board: str) -> list[tuple[str, ...]]:
                 prior.append(card)
     return out
 
-
 def _collection_segments(hand: Hand, targets: list[float]) -> list[tuple[float, set[str]]] | None:
     """Consume CoinPoker collection lines in main-pot/side-pot order.
-
     CoinPoker emits main-pot collections before subsequent side-pot collections.
     This lets us preserve the *actual* result of later side-pot play while replacing
     only an earlier locked pot with its all-in equity.  A collection line may span
@@ -368,7 +344,6 @@ def _collection_segments(hand: Hand, targets: list[float]) -> list[tuple[float, 
         out.append((hero_amt, winners))
     return out
 
-
 def _allin_adjustment(
     hand: Hand,
     results: dict[str, PlayerResult],
@@ -376,7 +351,6 @@ def _allin_adjustment(
     folded_players: set[str],
 ) -> tuple[float, float | None, bool, bool]:
     """Return (adjusted net cents, weighted equity, adjusted?, estimated?).
-
     v0.11 calculates EV at the *pot-layer* level.  If a short stack is all-in and
     deeper players continue on later streets, only the already-locked main pot is
     equity-adjusted; the later side-pot result stays actual.  This matches the
@@ -389,7 +363,6 @@ def _allin_adjustment(
     actual = float(hero.net_cents)
     if hand.game != "NLH":
         return actual, None, False, False
-
     pre_river_allins = [
         a for a in hand.actions
         if a.action == "ALLIN" and a.street != "RIVER"
@@ -398,7 +371,6 @@ def _allin_adjustment(
         return actual, None, False, False
     if any(a.player == hand.hero_name and a.action == "FOLD" for a in hand.actions):
         return actual, None, False, False
-
     first = min(pre_river_allins, key=lambda a: a.seq)
     first_order = _STREET_ORDER.get(first.street, -1)
     later_street_action = any(
@@ -407,7 +379,6 @@ def _allin_adjustment(
         and _STREET_ORDER.get(a.street, -1) > first_order
         for a in hand.actions
     )
-
     # If a player voluntarily enters the all-in pot after the first shove and then
     # folds on the same street without revealing, the live range is unknowable from
     # the export and is highly selected.  Keep the actual result for that hand.
@@ -419,7 +390,6 @@ def _allin_adjustment(
         )
         if prior_after_allin and fold.player not in shown_cards:
             return actual, None, False, False
-
     effective = {
         player: max(0, pr.contributed_cents - pr.returned_cents)
         for player, pr in results.items()
@@ -427,7 +397,6 @@ def _allin_adjustment(
     hero_eff = effective.get(hand.hero_name, 0)
     if hero_eff <= 0:
         return actual, None, False, False
-
     levels = sorted({c for c in effective.values() if c > 0})
     layers: list[tuple[int, int, list[str]]] = []  # (top level, gross cents, contributors)
     prev = 0
@@ -439,15 +408,13 @@ def _allin_adjustment(
         prev = level
     if not layers:
         return actual, None, False, False
-
     gross_from_layers = sum(amount for _, amount, _ in layers)
     player_total_pot = max(0, hand.total_pot_cents - hand.splash_cents)
-    net_pot = max(0, player_total_pot - hand.rake_cents)
+    net_pot = max(0, player_total_pot - hand.rake_cents - hand.splash_fee_cents)
     if gross_from_layers <= 0 or net_pot <= 0:
         return actual, None, False, False
     if abs(gross_from_layers - player_total_pot) > 1:
         return actual, None, False, False
-
     # When action continues later, the first all-in player's effective contribution
     # is the cap of the pot that was already locked.  Higher layers remain actual.
     if later_street_action:
@@ -459,7 +426,6 @@ def _allin_adjustment(
         work_layers = layers
     if not work_layers:
         return actual, None, False, False
-
     net_layers = [amount * (net_pot / gross_from_layers) for _, amount, _ in work_layers]
     actual_segments = _collection_segments(hand, net_layers) if later_street_action else None
     if later_street_action and actual_segments is None:
@@ -468,7 +434,6 @@ def _allin_adjustment(
     if actual_segments is not None:
         for _, names in actual_segments:
             locked_observed_names.update(names)
-
     dead_sets = _rit_dead_sets(hand, hand.first_allin_board)
     expected_return = 0.0
     actual_locked_return = 0.0
@@ -476,7 +441,6 @@ def _allin_adjustment(
     weighted_equity_den = 0.0
     adjusted_any = False
     estimated_any = False
-
     for li, ((_, gross_amount, contributors), net_layer) in enumerate(zip(work_layers, net_layers)):
         if hand.hero_name not in contributors:
             continue
@@ -488,7 +452,6 @@ def _allin_adjustment(
             assert actual_segments is not None
             hero_actual_layer, observed_winners = actual_segments[li]
             actual_locked_return += hero_actual_layer
-
         # A sole eligible player owns this layer deterministically.
         if len(eligible) == 1:
             expected_return += net_layer
@@ -497,7 +460,6 @@ def _allin_adjustment(
         hero_idx = eligible.index(hand.hero_name)
         known_flags = [len(shown_cards.get(p, "").split()) == 2 for p in eligible]
         equities_by_run: list[float] = []
-
         if all(known_flags):
             for dead in dead_sets:
                 if dead:
@@ -540,7 +502,6 @@ def _allin_adjustment(
             estimated_any = True
         else:
             return actual, None, False, False
-
         hero_eq = sum(equities_by_run) / len(equities_by_run)
         expected_return += net_layer * hero_eq
         weighted_equity_num += net_layer * hero_eq
@@ -549,7 +510,6 @@ def _allin_adjustment(
 
     if not adjusted_any:
         return actual, None, False, False
-
     weighted_equity = (weighted_equity_num / weighted_equity_den) if weighted_equity_den else None
     if later_street_action:
         # Replace only the locked pot's real return with its equity share.  Hero's
@@ -561,10 +521,8 @@ def _allin_adjustment(
         adjusted_net = expected_return - hero_eff
     return adjusted_net, weighted_equity, True, estimated_any
 
-
 class ParseError(ValueError):
     pass
-
 
 def _position_map(seats: list[Seat], button_seat: int) -> dict[int, str]:
     occupied = sorted(s.seat_no for s in seats)
@@ -595,7 +553,6 @@ def _position_map(seats: list[Seat], button_seat: int) -> dict[int, str]:
         labels = ["BTN"]
     return {seat: labels[i] if i < len(labels) else f"P{i+1}" for i, seat in enumerate(order)}
 
-
 def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
     lines = [ln.rstrip("\r") for ln in text.strip().splitlines()]
     if not lines:
@@ -604,7 +561,6 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
     m = HEADER_RE.match(lines[0].strip())
     if not m:
         raise ParseError(f"Unrecognized CoinPoker header: {lines[0]!r}")
-
     started = datetime.strptime(f"{m.group('date')} {m.group('time')}", "%Y/%m/%d %H:%M:%S")
     hand = Hand(
         hand_id=m.group("id"),
@@ -616,7 +572,6 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
         hero_name=hero_name,
         raw_text=text.strip() + "\n",
     )
-
     # First pass for table/seats so positions are known before stats are finalized.
     for line in lines[1:]:
         s = line.strip()
@@ -627,7 +582,6 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
         elif ms := SEAT_RE.match(s):
             seat_no, player, stack = ms.groups()
             hand.seats.append(Seat(int(seat_no), player, money_to_cents(stack)))
-
     posmap = _position_map(hand.seats, hand.button_seat)
     seat_by_player: dict[str, Seat] = {}
     for seat in hand.seats:
@@ -636,7 +590,6 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
         if seat.player == hero_name:
             hand.hero_seat = seat.seat_no
             hand.hero_position = seat.position
-
     results: dict[str, PlayerResult] = {
         seat.player: PlayerResult(
             player=seat.player,
@@ -646,7 +599,6 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
         )
         for seat in hand.seats
     }
-
     street = "PREFLOP"
     run_index = 1
     street_contrib: dict[str, int] = {p: 0 for p in results}
@@ -658,7 +610,6 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
     folded_players: set[str] = set()
     mucked_players: set[str] = set()
     current_board = ""
-
     def ensure_player(name: str) -> PlayerResult:
         if name not in results:
             results[name] = PlayerResult(player=name)
@@ -669,7 +620,6 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
         nonlocal seq
         seq += 1
         hand.actions.append(Action(seq, street, run_index, player, action, amount, to_amt, raw, aggressive, raise_no))
-
     for line in lines[1:]:
         s = line.strip()
         if not s:
@@ -686,7 +636,6 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
                 hand.hero_cards = cards
                 shown_cards[player] = cards
             continue
-
         if sm := STREET_RE.match(s):
             run_word, new_street = sm.groups()
             new_run = RUN_WORD[run_word]
@@ -703,21 +652,21 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
             any_board = True
             in_showdown = False
             continue
-
         if sd := SHOWDOWN_MARKER_RE.match(s):
             run_index = RUN_WORD[sd.group(1)]
             in_showdown = True
             continue
-
         if mp := POST_RE.match(s):
             player, kind, amount_s = mp.groups()
             amount = money_to_cents(amount_s)
             pr = ensure_player(player)
             pr.contributed_cents += amount
-            street_contrib[player] = street_contrib.get(player, 0) + amount
+            # Antes are forced dead money. CoinPoker's "raises ... to ..." amount
+            # is the betting-street total and does not include the ante.
+            if kind != "ante":
+                street_contrib[player] = street_contrib.get(player, 0) + amount
             add_action(player, kind.upper().replace(" ", "_"), amount, raw=s)
             continue
-
         if mst := STRADDLE_RE.match(s):
             player, amount_s = mst.groups()
             amount = money_to_cents(amount_s)
@@ -726,7 +675,6 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
             street_contrib[player] = street_contrib.get(player, 0) + amount
             add_action(player, "STRADDLE", amount, raw=s)
             continue
-
         if mr := RAISE_RE.match(s):
             player, by_s, to_s = mr.groups()
             to_amt = money_to_cents(to_s)
@@ -747,7 +695,6 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
                     pr.three_bet = True
             add_action(player, "RAISE", increment, to_amt, aggressive=True, raise_no=raise_no, raw=s)
             continue
-
         if mc := CALL_RE.match(s):
             player, amount_s = mc.groups()
             amount = money_to_cents(amount_s)
@@ -760,7 +707,6 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
                     pr.three_bet_opp = True
             add_action(player, "CALL", amount, raw=s)
             continue
-
         if mb := BET_RE.match(s):
             player, amount_s = mb.groups()
             amount = money_to_cents(amount_s)
@@ -769,7 +715,6 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
             street_contrib[player] = street_contrib.get(player, 0) + amount
             add_action(player, "BET", amount, aggressive=True, raw=s)
             continue
-
         if ma := ALLIN_RE.match(s):
             player, amount_s = ma.groups()
             amount = money_to_cents(amount_s)
@@ -797,7 +742,6 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
                 hand.first_allin_street = street
                 hand.first_allin_board = current_board
             continue
-
         if mret := RETURN_RE.match(s):
             player, amount_s = mret.groups()
             amount = money_to_cents(amount_s)
@@ -805,7 +749,6 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
             pr.returned_cents += amount
             add_action(player, "RETURN", amount, raw=s)
             continue
-
         if mf := FOLD_RE.match(s):
             player = mf.group(1)
             folded_players.add(player)
@@ -820,7 +763,6 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
         if mch := CHECK_RE.match(s):
             add_action(mch.group(1), "CHECK", raw=s)
             continue
-
         if msh := SHOW_RE.match(s):
             player = msh.group(1)
             shown_cards[player] = msh.group(2)
@@ -828,7 +770,6 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
             pr.went_to_showdown = True
             add_action(player, "SHOW", raw=s)
             continue
-
         if mm := MUCK_RE.match(s):
             player = mm.group(1)
             mucked_players.add(player)
@@ -836,7 +777,6 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
             pr.went_to_showdown = True
             add_action(player, "MUCK", raw=s)
             continue
-
         if mcol := COLLECT_RE.match(s):
             player, amount_s = mcol.groups()
             amount = money_to_cents(amount_s)
@@ -846,16 +786,15 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
                 pr.won_showdown = True
             add_action(player, "COLLECT", amount, raw=s)
             continue
-
         if mt := TOTAL_RE.match(s):
             hand.total_pot_cents = money_to_cents(mt.group(1))
             hand.rake_cents = money_to_cents(mt.group(2))
+            hand.splash_fee_cents = money_to_cents(mt.group(3))
             continue
 
         if mrn := RUN_RE.match(s):
             hand.run_count = RUN_MAP[mrn.group(1)]
             continue
-
         if mbd := BOARD_RE.match(s):
             which, cards = mbd.groups()
             idx = RUN_WORD[which]
@@ -869,7 +808,6 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
         if mend := END_RE.match(s):
             hand.ended_at = datetime.strptime(f"{mend.group(1)} {mend.group(2)}", "%Y/%m/%d %H:%M:%S")
             continue
-
     splash_awards = _splash_awards(hand, results, shown_cards, folded_players, mucked_players)
     for pr in results.values():
         pr.splash_won_cents = splash_awards.get(pr.player, 0)
@@ -880,7 +818,6 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
         pr.saw_flop = any_board and not pr.folded_preflop
         # A player can muck at showdown, or show on any runout. Winners that never show
         # (everyone else folded) are deliberately not counted as W$SD.
-
     adj, equity, adjusted, estimated = _allin_adjustment(hand, results, shown_cards, folded_players)
     hero_pr = results.get(hand.hero_name)
     if hero_pr is not None:
@@ -891,7 +828,6 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
     for pr in results.values():
         if pr.player != hand.hero_name:
             pr.allin_adj_cents = float(pr.net_cents)
-
     hand.player_results = results
     # Summary says run count; guarantee a useful board slot for run-once hands.
     if not hand.boards:
@@ -901,7 +837,6 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
 
 def iter_hand_texts(text: str, require_complete: bool = True) -> Iterator[str]:
     """Yield CoinPoker hand blocks from arbitrary text.
-
     require_complete=True skips a trailing hand that has not reached SUMMARY/Game ended yet,
     which makes this safe for files CoinPoker is actively appending to.
     """
@@ -914,7 +849,6 @@ def iter_hand_texts(text: str, require_complete: bool = True) -> Iterator[str]:
         if require_complete and ("*** SUMMARY ***" not in block or "Game ended:" not in block):
             continue
         yield block + "\n"
-
 
 def parse_file(path: str, hero_name: str = "Hero") -> Iterator[Hand]:
     with open(path, "r", encoding="utf-8", errors="replace") as f:
