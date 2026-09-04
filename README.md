@@ -16,6 +16,10 @@ Open the latest release and download:
 
 > **Windows SmartScreen:** The installer may currently show an "unrecognized app" warning because the application as it builds reputation. You will need to click "More Info" and choose **Run anyway**.
 
+## Discord
+
+For additional information or any questions feel free to join the **[Discord](https://discord.gg/e5B3hGJzj5)**
+
 ![Project Screenshot](assets/Overview.png)
 ![Project Screenshot](assets/Replayer.png)
 ![Project Screenshot](assets/Session.png)
