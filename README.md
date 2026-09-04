@@ -6,8 +6,6 @@ CoinPoker Tracker imports your local CoinPoker hand-history files and gives you 
 
 It is intentionally a **simple tracker**, not a full poker analysis suite.
 
-![Project Screenshot](assets/Overview.png)
-
 ## Download
 
 **[Download the latest Windows release](https://github.com/mleclerc182/CoinPokerTracker/releases/latest)**
@@ -18,22 +16,27 @@ Open the latest release and download:
 
 > **Windows SmartScreen:** The installer may currently show an "unrecognized app" warning because the application as it builds reputation. You will need to click "More Info" and choose **Run anyway**.
 
+![Project Screenshot](assets/Overview.png)
+![Project Screenshot](assets/Replayer.png)
+![Project Screenshot](assets/Session.png)
+
 ## What it does
 
 CoinPoker Tracker currently provides:
 
 - Import of CoinPoker cash-game hand-history files
 - Duplicate-safe hand importing
+- Graphical hand replayer with action-by-action playback
+- Profit graphs
 - Overall winnings and bb/100
 - VPIP, PFR, 3-Bet, WWSF, WTSD, and W$SD
 - All-in adjusted results
 - Splash-pot tracking
 - Run-it-twice / multi-run tracking
-- Profit graphs
-- Session results
+- Session results with per-session hand drill-down
 - Position results
 - Individual hand-history viewing
-- Basic date, stakes, Splash, and runout filtering
+- Application-wide date, stakes, Splash, runout, and Hero-contribution filtering
 - Customizable Overview stat cards
 - Local SQLite database storage
 
@@ -45,7 +48,6 @@ This project is deliberately focused on straightforward results tracking.
 
 It does **not** aim to compete with full-featured commercial poker tracking software and currently does not provide features such as:
 
-- Graphical hand replayers
 - HUDs
 - Advanced opponent analysis
 - Detailed report builders
@@ -70,9 +72,11 @@ Python is **not** required when installing the Windows release.
 
 1. Install CoinPoker Tracker using `CoinPokerTracker-Setup.exe`.
 2. Open the application.
-3. Use **Import → Import hand-history file** or **Import → Import folder**.
+3. Use **File → Import → Hand-history file** or **File → Import → Folder**.
 4. Select your CoinPoker hand-history file(s).
 5. Review your results from the Overview, Hands, Sessions, and Position tabs.
+6. Double-click any row in the Hands tab to replay that hand.
+7. Use **Filters → Edit filters** to filter every tab, including by the minimum or maximum BB Hero contributed to the pot. Active filters remain visible in the status bar.
 
 Previously imported hands are detected automatically, so importing the same history again will not duplicate them.
 

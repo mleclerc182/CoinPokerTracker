@@ -178,6 +178,12 @@ def test_sessions_expose_all_hand_ids_for_session_delete(tmp_path):
         assert sessions[0]["hand_ids"] == ["910003"]
         assert sessions[1]["hand_ids"] == ["910001", "910002"]
 
+        session_hands = db.hands_by_ids(sessions[1]["hand_ids"])
+        assert [row["hand_id"] for row in session_hands] == [
+            "910002",
+            "910001",
+        ]
+
         deleted = db.delete_hands(sessions[1]["hand_ids"])
         assert deleted == 2
         assert db.conn.execute("SELECT COUNT(*) FROM hands").fetchone()[0] == 1
@@ -185,6 +191,57 @@ def test_sessions_expose_all_hand_ids_for_session_delete(tmp_path):
             assert db.conn.execute(
                 f"SELECT COUNT(*) FROM {table} WHERE hand_id IN ('910001','910002')"
             ).fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_contributed_bb_filter_uses_net_chips_put_in_the_pot(tmp_path):
+    db = TrackerDB(tmp_path / "tracker.sqlite3")
+    try:
+        hands = [
+            _hand_at(
+                "920001",
+                "2026/08/27 07:00:00",
+                "2026/08/27 07:00:10",
+            ),
+            _hand_at(
+                "920002",
+                "2026/08/27 07:10:00",
+                "2026/08/27 07:10:10",
+            ),
+        ]
+        assert db.import_hands(hands) == (2, 0)
+
+        # Both hands use a 2-cent BB. The first contributes 6 cents and
+        # receives 4 cents back (1 BB net); the second contributes 20 and
+        # receives 4 back (8 BB net).
+        with db.conn:
+            db.conn.execute(
+                "UPDATE hands SET hero_contributed_cents=20, "
+                "hero_returned_cents=4 WHERE hand_id='920002'"
+            )
+
+        rows = db.hands()
+        assert rows[0]["hero_contributed_cents"] == 20
+        assert rows[0]["hero_returned_cents"] == 4
+
+        minimum = db.hands({"contributed_bb_min": 2})
+        assert [row["hand_id"] for row in minimum] == ["920002"]
+
+        maximum = db.hands({"contributed_bb_max": 1})
+        assert [row["hand_id"] for row in maximum] == ["920001"]
+
+        exact_range = db.hands(
+            {
+                "contributed_bb_min": 8,
+                "contributed_bb_max": 8,
+            }
+        )
+        assert [row["hand_id"] for row in exact_range] == ["920002"]
+        assert db.overview({"contributed_bb_min": 2})["hands"] == 1
+        assert db.sessions(30, {"contributed_bb_max": 1})[0][
+            "hand_ids"
+        ] == ["920001"]
     finally:
         db.close()
 

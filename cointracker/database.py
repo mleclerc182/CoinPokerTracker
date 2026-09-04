@@ -357,6 +357,20 @@ class TrackerDB:
         if filters.get("position"):
             clauses.append("hero_position = ?")
             params.append(filters["position"])
+        if filters.get("contributed_bb_min") is not None:
+            clauses.append(
+                "(bb_cents > 0 AND "
+                "CAST(hero_contributed_cents - hero_returned_cents AS REAL) "
+                "/ bb_cents >= ?)"
+            )
+            params.append(float(filters["contributed_bb_min"]))
+        if filters.get("contributed_bb_max") is not None:
+            clauses.append(
+                "(bb_cents > 0 AND "
+                "CAST(hero_contributed_cents - hero_returned_cents AS REAL) "
+                "/ bb_cents <= ?)"
+            )
+            params.append(float(filters["contributed_bb_max"]))
         return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
 
     def rakeback_stakes(self) -> list[tuple[int, int]]:
@@ -479,13 +493,57 @@ class TrackerDB:
         return self.conn.execute(
             f"""SELECT hand_id, started_at, sb_cents, bb_cents, hero_position, hero_cards,
                 board1, board2, board3, run_count, splash_type, splash_cents,
-                total_pot_cents, rake_cents, hero_splash_won_cents, hero_net_cents,
+                total_pot_cents, rake_cents, hero_contributed_cents,
+                hero_returned_cents, hero_splash_won_cents, hero_net_cents,
                 hero_allin_adj_cents, hero_allin_equity, hero_allin_adjusted, hero_allin_estimated
                 FROM hands{where} ORDER BY started_at DESC, hand_id DESC LIMIT ?""", params
         ).fetchall()
+
+    def hands_by_ids(self, hand_ids: Iterable[str]) -> list[sqlite3.Row]:
+        """Return full Hands-tab rows for an explicit set of stored hand IDs."""
+        ids = list(dict.fromkeys(str(hand_id) for hand_id in hand_ids if hand_id))
+        if not ids:
+            return []
+
+        rows: list[sqlite3.Row] = []
+        for index in range(0, len(ids), 800):
+            chunk = ids[index:index + 800]
+            marks = ",".join("?" for _ in chunk)
+            rows.extend(
+                self.conn.execute(
+                    f"""SELECT hand_id, started_at, sb_cents, bb_cents,
+                        hero_position, hero_cards, board1, board2, board3,
+                        run_count, splash_type, splash_cents, total_pot_cents,
+                        rake_cents, hero_contributed_cents, hero_returned_cents,
+                        hero_splash_won_cents, hero_net_cents,
+                        hero_allin_adj_cents, hero_allin_equity,
+                        hero_allin_adjusted, hero_allin_estimated
+                        FROM hands WHERE hand_id IN ({marks})""",
+                    chunk,
+                ).fetchall()
+            )
+        return sorted(
+            rows,
+            key=lambda row: (row["started_at"], row["hand_id"]),
+            reverse=True,
+        )
+
     def raw_hand(self, hand_id: str) -> str:
         r = self.conn.execute("SELECT raw_text FROM hands WHERE hand_id=?", (hand_id,)).fetchone()
         return r[0] if r else ""
+
+    def replay_hand(self, hand_id: str) -> Hand | None:
+        """Reparse one stored hand with the hero name used at import time."""
+        row = self.conn.execute(
+            "SELECT hero_name, raw_text FROM hands WHERE hand_id=?",
+            (hand_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return parse_hand(
+            row["raw_text"],
+            hero_name=row["hero_name"] or "Hero",
+        )
 
     def delete_hands(self, hand_ids: Iterable[str]) -> int:
         """Delete hands and all dependent rows. Returns the number of hands removed."""
