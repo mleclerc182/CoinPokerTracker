@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from PySide6.QtCore import QDate, QSettings, Qt, Signal, QThread
-from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPen
+from PySide6.QtCore import QDate, QLocale, QSettings, Qt, Signal, QThread
+from PySide6.QtGui import QAction, QColor, QDoubleValidator, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCalendarWidget, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
@@ -17,6 +17,8 @@ from .equity import evaluator_available
 from .importer import import_file, import_folder
 from .graphing import hand_tick_step, hand_ticks, money_axis_bounds, nice_step
 from .handtable import card_text_segments, hole_card_sort_key, normalize_hole_cards
+from .replay import build_replay
+from .replayer import HandReplayerDialog
 
 
 OVERVIEW_CARD_TITLES = [
@@ -45,6 +47,26 @@ CARD_ACCENTS = {
     "Splash hands": "#fb7185",
     "RIT hands": "#a78bfa",
 }
+
+HAND_TABLE_HEADERS = [
+    "Date",
+    "Hand",
+    "Stakes",
+    "Pos",
+    "Cards",
+    "Board(s)",
+    "Runs",
+    "Splash",
+    "Splash won",
+    "Pot",
+    "Hero Contrib (BB)",
+    "Net Won",
+    "AI Eq",
+    "AI Adj BB",
+]
+HERO_CONTRIB_COLUMN = HAND_TABLE_HEADERS.index(
+    "Hero Contrib (BB)"
+)
 
 
 def fmt_money(cents: int) -> str:
@@ -984,13 +1006,16 @@ class FiltersBar(QWidget):
     ):
         super().__init__()
 
-        lay = QHBoxLayout(self)
+        lay = QGridLayout(self)
         lay.setContentsMargins(
             0,
             0,
             0,
             0,
         )
+        lay.setHorizontalSpacing(12)
+        lay.setVerticalSpacing(10)
+        lay.setColumnStretch(1, 1)
         # None means "Any".
         # No fake year-2000 sentinel is used.
         self.date_from = OptionalDatePicker()
@@ -1033,6 +1058,34 @@ class FiltersBar(QWidget):
                 "Run it 2x/3x",
             ]
         )
+        self.bb_contributed_min = QLineEdit()
+        self.bb_contributed_max = QLineEdit()
+        for control, placeholder, tooltip in (
+            (
+                self.bb_contributed_min,
+                "Any minimum",
+                "Minimum BB Hero put into the pot after returned chips",
+            ),
+            (
+                self.bb_contributed_max,
+                "Any maximum",
+                "Maximum BB Hero put into the pot after returned chips",
+            ),
+        ):
+            validator = QDoubleValidator(
+                0.0,
+                1_000_000.0,
+                2,
+                control,
+            )
+            validator.setLocale(QLocale.c())
+            validator.setNotation(
+                QDoubleValidator.StandardNotation
+            )
+            control.setValidator(validator)
+            control.setPlaceholderText(placeholder)
+            control.setToolTip(tooltip)
+            control.setClearButtonEnabled(True)
         self.date_from.dateChanged.connect(
             self.changed.emit
         )
@@ -1048,26 +1101,50 @@ class FiltersBar(QWidget):
         self.runs.currentIndexChanged.connect(
             lambda _index: self.changed.emit()
         )
-        lay.addWidget(QLabel("From"))
-        lay.addWidget(self.date_from)
+        self.bb_contributed_min.textChanged.connect(
+            lambda _text: self.changed.emit()
+        )
+        self.bb_contributed_max.textChanged.connect(
+            lambda _text: self.changed.emit()
+        )
+        for control in (
+            self.date_from,
+            self.date_to,
+            self.stakes,
+            self.splash,
+            self.runs,
+            self.bb_contributed_min,
+            self.bb_contributed_max,
+        ):
+            control.setMinimumWidth(300)
 
-        lay.addWidget(QLabel("To"))
-        lay.addWidget(self.date_to)
+        lay.addWidget(QLabel("From"), 0, 0)
+        lay.addWidget(self.date_from, 0, 1)
+        lay.addWidget(QLabel("To"), 1, 0)
+        lay.addWidget(self.date_to, 1, 1)
 
-        lay.addWidget(
+        quick_dates = QHBoxLayout()
+        quick_dates.setContentsMargins(0, 0, 0, 0)
+        quick_dates.addWidget(
             self.all_dates_button
         )
-        lay.addWidget(
+        quick_dates.addWidget(
             self.today_button
         )
+        quick_dates.addStretch(1)
+        lay.addWidget(QLabel("Quick dates"), 2, 0)
+        lay.addLayout(quick_dates, 2, 1)
 
-        lay.addWidget(QLabel("Stakes"))
-        lay.addWidget(self.stakes)
-
-        lay.addWidget(self.splash)
-        lay.addWidget(self.runs)
-
-        lay.addStretch(1)
+        lay.addWidget(QLabel("Stakes"), 3, 0)
+        lay.addWidget(self.stakes, 3, 1)
+        lay.addWidget(QLabel("Splash pots"), 4, 0)
+        lay.addWidget(self.splash, 4, 1)
+        lay.addWidget(QLabel("Runouts"), 5, 0)
+        lay.addWidget(self.runs, 5, 1)
+        lay.addWidget(QLabel("Min contributed (BB)"), 6, 0)
+        lay.addWidget(self.bb_contributed_min, 6, 1)
+        lay.addWidget(QLabel("Max contributed (BB)"), 7, 0)
+        lay.addWidget(self.bb_contributed_max, 7, 1)
 
         self.refresh_stakes(db)
 
@@ -1094,6 +1171,31 @@ class FiltersBar(QWidget):
         self.date_from.blockSignals(False)
         self.date_to.blockSignals(False)
 
+        self.changed.emit()
+
+    def clear_all(self):
+        controls = [
+            self.date_from,
+            self.date_to,
+            self.stakes,
+            self.splash,
+            self.runs,
+            self.bb_contributed_min,
+            self.bb_contributed_max,
+        ]
+        for control in controls:
+            control.blockSignals(True)
+
+        self.date_from.clearDate()
+        self.date_to.clearDate()
+        self.stakes.setCurrentIndex(0)
+        self.splash.setCurrentIndex(0)
+        self.runs.setCurrentIndex(0)
+        self.bb_contributed_min.clear()
+        self.bb_contributed_max.clear()
+
+        for control in controls:
+            control.blockSignals(False)
         self.changed.emit()
 
     def refresh_stakes(
@@ -1156,7 +1258,156 @@ class FiltersBar(QWidget):
             "all",
         )
 
+        contributed_min = self._optional_bb_value(
+            self.bb_contributed_min
+        )
+        contributed_max = self._optional_bb_value(
+            self.bb_contributed_max
+        )
+        if contributed_min is not None:
+            f["contributed_bb_min"] = contributed_min
+        if contributed_max is not None:
+            f["contributed_bb_max"] = contributed_max
+
         return f
+
+    @staticmethod
+    def _optional_bb_value(control: QLineEdit) -> float | None:
+        text = control.text().strip()
+        if not text:
+            return None
+        try:
+            return max(0.0, float(text))
+        except ValueError:
+            return None
+
+    def summary(self) -> str:
+        parts = []
+        has_from = self.date_from.has_date()
+        has_to = self.date_to.has_date()
+        if has_from and has_to:
+            date_from = self.date_from.date().toString(
+                "yyyy-MM-dd"
+            )
+            date_to = self.date_to.date().toString(
+                "yyyy-MM-dd"
+            )
+            if date_from == date_to:
+                parts.append(
+                    date_from
+                )
+            else:
+                parts.append(
+                    f"{date_from} to {date_to}"
+                )
+        elif has_from:
+            parts.append(
+                "From "
+                + self.date_from.date().toString(
+                    "yyyy-MM-dd"
+                )
+            )
+        elif has_to:
+            parts.append(
+                "Through "
+                + self.date_to.date().toString(
+                    "yyyy-MM-dd"
+                )
+            )
+
+        if self.stakes.currentData() is not None:
+            parts.append(
+                self.stakes.currentText()
+            )
+        if self.splash.currentIndex() == 1:
+            parts.append(
+                "Splash only"
+            )
+        elif self.splash.currentIndex() == 2:
+            parts.append(
+                "No splash pots"
+            )
+        if self.runs.currentIndex() == 1:
+            parts.append(
+                "Run once"
+            )
+        elif self.runs.currentIndex() == 2:
+            parts.append(
+                "Multi-run only"
+            )
+        contributed_min = self._optional_bb_value(
+            self.bb_contributed_min
+        )
+        contributed_max = self._optional_bb_value(
+            self.bb_contributed_max
+        )
+        if (
+            contributed_min is not None
+            and contributed_max is not None
+        ):
+            parts.append(
+                "Contributed "
+                f"{contributed_min:g}–{contributed_max:g} BB"
+            )
+        elif contributed_min is not None:
+            parts.append(
+                f"Contributed ≥ {contributed_min:g} BB"
+            )
+        elif contributed_max is not None:
+            parts.append(
+                f"Contributed ≤ {contributed_max:g} BB"
+            )
+        return " · ".join(parts) if parts else "All hands"
+
+
+class FiltersDialog(QDialog):
+    """Compact editor for the application-wide tracker filters."""
+
+    def __init__(
+        self,
+        filters: FiltersBar,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(
+            "Filters"
+        )
+        self.setMinimumWidth(
+            520
+        )
+
+        lay = QVBoxLayout(self)
+        help_text = QLabel(
+            "These filters apply to Overview, Hands, Sessions, and Position. "
+            "Changes are applied immediately."
+        )
+        help_text.setWordWrap(True)
+        help_text.setStyleSheet(
+            "color: #9fc5f8;"
+        )
+        lay.addWidget(
+            help_text
+        )
+        lay.addWidget(
+            filters
+        )
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Close
+        )
+        clear_button = buttons.addButton(
+            "Clear all filters",
+            QDialogButtonBox.ResetRole,
+        )
+        clear_button.clicked.connect(
+            filters.clear_all
+        )
+        buttons.rejected.connect(
+            self.reject
+        )
+        lay.addWidget(
+            buttons
+        )
 
 
 class MainWindow(QMainWindow):
@@ -1185,7 +1436,7 @@ class MainWindow(QMainWindow):
         self.worker = None
 
         self.setWindowTitle(
-            "CoinPoker Tracker v1.0.4"
+            "CoinPoker Tracker v1.0.6"
         )
         self.resize(
             1280,
@@ -1194,11 +1445,34 @@ class MainWindow(QMainWindow):
 
         self._apply_theme()
 
+        self.filters = FiltersBar(
+            self.db
+        )
+        self.filters.changed.connect(
+            self._filters_changed
+        )
+        self.filters_dialog = FiltersDialog(
+            self.filters,
+            self,
+        )
+
+        self.filter_summary_label = QLabel()
+        self.filter_summary_label.setMaximumWidth(
+            720
+        )
+        self.filter_summary_label.setToolTip(
+            "Use the Filters menu to change application-wide filters."
+        )
+
         self.import_progress = QProgressBar()
         self.import_progress.setMinimumWidth(260)
         self.import_progress.setTextVisible(True)
         self.import_progress.hide()
 
+        self.statusBar().addPermanentWidget(
+            self.filter_summary_label,
+            1,
+        )
         self.statusBar().addPermanentWidget(
             self.import_progress
         )
@@ -1416,17 +1690,20 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _build_menu(self):
-        menu = self.menuBar().addMenu(
+        file_menu = self.menuBar().addMenu(
+            "File"
+        )
+        import_menu = file_menu.addMenu(
             "Import"
         )
 
         a_file = QAction(
-            "Import hand-history file…",
+            "Hand-history file…",
             self,
         )
 
         a_folder = QAction(
-            "Import folder…",
+            "Folder…",
             self,
         )
 
@@ -1437,59 +1714,106 @@ class MainWindow(QMainWindow):
             self.choose_folder
         )
 
-        menu.addAction(a_file)
-        menu.addAction(a_folder)
+        import_menu.addAction(a_file)
+        import_menu.addAction(a_folder)
+
+        file_menu.addSeparator()
+
+        rakeback = QAction(
+            "Add/Edit Rakeback…",
+            self,
+        )
+        rakeback.setToolTip(
+            "Enter manual rakeback for a cash-game stake"
+        )
+        rakeback.triggered.connect(
+            self.edit_rakeback
+        )
+        file_menu.addAction(
+            rakeback
+        )
+
+        customize_cards = QAction(
+            "Customize Overview cards…",
+            self,
+        )
+        customize_cards.setToolTip(
+            "Reorder, hide, or restore Overview stat cards"
+        )
+        customize_cards.triggered.connect(
+            self.customize_overview_cards
+        )
+        file_menu.addAction(
+            customize_cards
+        )
+
+        filters_menu = self.menuBar().addMenu(
+            "Filters"
+        )
+        edit_filters = QAction(
+            "Edit filters…",
+            self,
+        )
+        edit_filters.triggered.connect(
+            self.open_filters
+        )
+        filters_menu.addAction(
+            edit_filters
+        )
+
+        self.clear_filters_action = QAction(
+            "Clear all filters",
+            self,
+        )
+        self.clear_filters_action.triggered.connect(
+            self.filters.clear_all
+        )
+        filters_menu.addAction(
+            self.clear_filters_action
+        )
+
+    def open_filters(self):
+        self.filters.refresh_stakes(
+            self.db
+        )
+        self.filters_dialog.exec()
+
+    def _filters_changed(self):
+        self.refresh_all()
+
+    def _update_filter_summary(self):
+        summary = self.filters.summary()
+        active = summary != "All hands"
+        self.filter_summary_label.setText(
+            f"Filters: {summary}"
+        )
+        self.filter_summary_label.setStyleSheet(
+            "padding: 2px 8px; font-weight: 700; color: "
+            + (
+                "#fbbf24;"
+                if active
+                else "#8fa9c9;"
+            )
+        )
+        self.filter_summary_label.setToolTip(
+            (
+                "Active across Overview, Hands, Sessions, and Position: "
+                + summary
+                if active
+                else "No filters are active. Use the Filters menu to narrow all tabs."
+            )
+        )
+        if hasattr(
+            self,
+            "clear_filters_action",
+        ):
+            self.clear_filters_action.setEnabled(
+                active
+            )
 
     def _build_overview(self):
         w = QWidget()
         outer = QVBoxLayout(w)
-
-        top = QHBoxLayout()
-
-        self.filters = FiltersBar(
-            self.db
-        )
-
-        self.filters.changed.connect(
-            self.refresh_all
-        )
-
-        top.addWidget(
-            self.filters,
-            1,
-        )
-
-        self.rakeback_button = QPushButton(
-            "Add/Edit Rakeback"
-        )
-        self.rakeback_button.setToolTip(
-            "Enter manual rakeback for a cash-game stake"
-        )
-        self.rakeback_button.clicked.connect(
-            self.edit_rakeback
-        )
-        top.addWidget(
-            self.rakeback_button
-        )
-
-        self.customize_cards_button = QPushButton(
-            "Customize cards"
-        )
-
-        self.customize_cards_button.setToolTip(
-            "Reorder, hide, or restore Overview stat cards"
-        )
-
-        self.customize_cards_button.clicked.connect(
-            self.customize_overview_cards
-        )
-
-        top.addWidget(
-            self.customize_cards_button
-        )
-
-
-        outer.addLayout(top)
 
         self.card_grid = QGridLayout()
         self.cards = {
@@ -1862,6 +2186,13 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(
             self.delete_hands_button
         )
+        replay_hint = QLabel(
+            "Double-click a hand to open the replayer"
+        )
+        replay_hint.setStyleSheet(
+            "color: #8fa9c9;"
+        )
+        toolbar.addWidget(replay_hint)
         toolbar.addStretch(1)
 
         lay.addLayout(toolbar)
@@ -1872,24 +2203,15 @@ class MainWindow(QMainWindow):
 
         self.hand_table = QTableWidget(
             0,
-            13,
+            len(HAND_TABLE_HEADERS),
         )
         self.hand_table.setHorizontalHeaderLabels(
-            [
-                "Date",
-                "Hand",
-                "Stakes",
-                "Pos",
-                "Cards",
-                "Board(s)",
-                "Runs",
-                "Splash",
-                "Splash won",
-                "Pot",
-                "Net Won",
-                "AI Eq",
-                "AI Adj BB",
-            ]
+            HAND_TABLE_HEADERS
+        )
+        self.hand_table.horizontalHeaderItem(
+            HERO_CONTRIB_COLUMN
+        ).setToolTip(
+            "Hero's total contribution after returned chips, divided by the big blind"
         )
 
         header = (
@@ -1957,6 +2279,9 @@ class MainWindow(QMainWindow):
 
         self.hand_table.itemSelectionChanged.connect(
             self.show_selected_hand
+        )
+        self.hand_table.cellDoubleClicked.connect(
+            self.open_hand_replayer
         )
         self.raw = QPlainTextEdit()
         self.raw.setReadOnly(True)
@@ -2048,8 +2373,105 @@ class MainWindow(QMainWindow):
         )
         self._session_rows = []
 
-        lay.addWidget(
+        self.session_table.cellClicked.connect(
+            self.show_selected_session_hands
+        )
+
+        split = QSplitter(
+            Qt.Vertical
+        )
+        split.addWidget(
             self.session_table
+        )
+
+        hands_panel = QWidget()
+        hands_layout = QVBoxLayout(
+            hands_panel
+        )
+        hands_layout.setContentsMargins(
+            0,
+            5,
+            0,
+            0,
+        )
+        self.session_hands_label = QLabel(
+            "Select a session to view its hands"
+        )
+        self.session_hands_label.setStyleSheet(
+            "color: #9fc5f8; font-weight: 700;"
+        )
+        hands_layout.addWidget(
+            self.session_hands_label
+        )
+
+        self.session_hand_table = QTableWidget(
+            0,
+            len(HAND_TABLE_HEADERS),
+        )
+        self.session_hand_table.setHorizontalHeaderLabels(
+            HAND_TABLE_HEADERS
+        )
+        self.session_hand_table.horizontalHeaderItem(
+            HERO_CONTRIB_COLUMN
+        ).setToolTip(
+            "Hero's total contribution after returned chips, divided by the big blind"
+        )
+        session_hand_header = (
+            self.session_hand_table
+            .horizontalHeader()
+        )
+        session_hand_header.setSectionResizeMode(
+            QHeaderView.ResizeToContents
+        )
+        session_hand_header.setSectionResizeMode(
+            5,
+            QHeaderView.Stretch,
+        )
+        session_hand_header.setSortIndicator(
+            0,
+            Qt.DescendingOrder,
+        )
+        self.session_hand_table.setAlternatingRowColors(
+            True
+        )
+        self.session_hand_table.setSelectionBehavior(
+            QTableWidget.SelectRows
+        )
+        self.session_hand_table.setSelectionMode(
+            QAbstractItemView.SingleSelection
+        )
+        self.session_hand_table.setEditTriggers(
+            QTableWidget.NoEditTriggers
+        )
+        self.session_hand_table.setItemDelegateForColumn(
+            4,
+            CardSuitDelegate(
+                self.session_hand_table
+            ),
+        )
+        self.session_hand_table.setItemDelegateForColumn(
+            5,
+            CardSuitDelegate(
+                self.session_hand_table
+            ),
+        )
+        self.session_hand_table.cellDoubleClicked.connect(
+            self.open_hand_replayer
+        )
+        self.session_hand_table.setSortingEnabled(
+            True
+        )
+        hands_layout.addWidget(
+            self.session_hand_table
+        )
+        split.addWidget(
+            hands_panel
+        )
+        split.setSizes(
+            [310, 360]
+        )
+        lay.addWidget(
+            split
         )
 
         self.tabs.addTab(
@@ -2261,14 +2683,8 @@ class MainWindow(QMainWindow):
         )
 
     def refresh_all(self):
-        f = (
-            self.filters.filters()
-            if hasattr(
-                self,
-                "filters",
-            )
-            else {}
-        )
+        f = self.filters.filters()
+        self._update_filter_summary()
 
         o = self.db.overview(f)
 
@@ -2420,6 +2836,7 @@ class MainWindow(QMainWindow):
             10,
             11,
             12,
+            13,
         }
         if column == self._hand_sort_column:
             self._hand_sort_order = (
@@ -2501,6 +2918,15 @@ class MainWindow(QMainWindow):
                 r["total_pot_cents"]
                 or 0
             ),
+            (
+                float(
+                    int(r["hero_contributed_cents"])
+                    - int(r["hero_returned_cents"])
+                )
+                / int(r["bb_cents"])
+                if r["bb_cents"]
+                else float("-inf")
+            ),
             int(
                 r["hero_net_cents"]
                 or 0
@@ -2531,17 +2957,15 @@ class MainWindow(QMainWindow):
             ),
         ]
 
-    def refresh_hands(
+    def _populate_hand_table(
         self,
-        f,
+        table: QTableWidget,
+        rows,
     ):
-        rows = self.db.hands(f)
-
-        self.hand_table.setRowCount(0)
-        self.hand_table.setRowCount(
+        table.setRowCount(0)
+        table.setRowCount(
             len(rows)
         )
-
         for i, r in enumerate(rows):
             boards = " | ".join(
                 x
@@ -2551,6 +2975,15 @@ class MainWindow(QMainWindow):
                     r["board3"],
                 ]
                 if x
+            )
+            hero_contributed_bb = (
+                (
+                    int(r["hero_contributed_cents"])
+                    - int(r["hero_returned_cents"])
+                )
+                / int(r["bb_cents"])
+                if r["bb_cents"]
+                else None
             )
             vals = [
                 r["started_at"][:19],
@@ -2584,6 +3017,11 @@ class MainWindow(QMainWindow):
                 ),
                 fmt_money(
                     r["total_pot_cents"]
+                ),
+                (
+                    f"{hero_contributed_bb:.2f}"
+                    if hero_contributed_bb is not None
+                    else ""
                 ),
                 fmt_money(
                     r["hero_net_cents"]
@@ -2635,7 +3073,7 @@ class MainWindow(QMainWindow):
                     sort_values,
                 )
             ):
-                self.hand_table.setItem(
+                table.setItem(
                     i,
                     j,
                     SortableTableWidgetItem(
@@ -2643,6 +3081,16 @@ class MainWindow(QMainWindow):
                         sort_value,
                     ),
                 )
+
+    def refresh_hands(
+        self,
+        f,
+    ):
+        rows = self.db.hands(f)
+        self._populate_hand_table(
+            self.hand_table,
+            rows,
+        )
         if rows:
             self.hand_table.sortItems(
                 self._hand_sort_column,
@@ -2675,6 +3123,51 @@ class MainWindow(QMainWindow):
                     item.text()
                 )
             )
+
+    def open_hand_replayer(
+        self,
+        row: int,
+        _column: int,
+    ):
+        source_table = self.sender()
+        table = (
+            source_table
+            if isinstance(
+                source_table,
+                QTableWidget,
+            )
+            else self.hand_table
+        )
+        item = table.item(
+            row,
+            1,
+        )
+        if item is None:
+            return
+
+        try:
+            hand = self.db.replay_hand(
+                item.text()
+            )
+            if hand is None:
+                raise ValueError(
+                    "The selected hand is no longer in the database."
+                )
+            replay = build_replay(hand)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Hand Replayer",
+                "This hand could not be prepared for replay.\n\n"
+                f"{type(exc).__name__}: {exc}",
+            )
+            return
+
+        dialog = HandReplayerDialog(
+            replay,
+            self,
+        )
+        dialog.exec()
 
     def delete_selected_hands(self):
         rows = sorted(
@@ -2758,6 +3251,10 @@ class MainWindow(QMainWindow):
 
         self._session_rows = rows
 
+        self.session_table.blockSignals(
+            True
+        )
+        self.session_table.clearSelection()
         self.session_table.setRowCount(
             len(rows)
         )
@@ -2797,6 +3294,118 @@ class MainWindow(QMainWindow):
                     j,
                     QTableWidgetItem(v),
                 )
+        self.session_table.blockSignals(
+            False
+        )
+        self.show_selected_session_hands()
+
+    def show_selected_session_hands(
+        self,
+        clicked_row: int | None = None,
+        _column: int | None = None,
+    ):
+        selected_rows = sorted(
+            {
+                index.row()
+                for index
+                in self.session_table
+                .selectionModel()
+                .selectedRows()
+            }
+        )
+        if (
+            clicked_row is not None
+            and clicked_row >= 0
+            and clicked_row not in selected_rows
+        ):
+            selected_rows.append(
+                clicked_row
+            )
+            selected_rows.sort()
+        sessions = [
+            self._session_rows[row]
+            for row in selected_rows
+            if 0
+            <= row
+            < len(
+                self._session_rows
+            )
+        ]
+        hand_ids = list(
+            dict.fromkeys(
+                hand_id
+                for session in sessions
+                for hand_id in session.get(
+                    "hand_ids",
+                    [],
+                )
+            )
+        )
+        try:
+            rows = self.db.hands_by_ids(
+                hand_ids
+            )
+
+            self.session_hand_table.setSortingEnabled(
+                False
+            )
+            self._populate_hand_table(
+                self.session_hand_table,
+                rows,
+            )
+            self.session_hand_table.setSortingEnabled(
+                True
+            )
+            self.session_hand_table.sortItems(
+                0,
+                Qt.DescendingOrder,
+            )
+        except Exception as exc:
+            self.session_hand_table.setSortingEnabled(
+                False
+            )
+            self.session_hand_table.setRowCount(
+                0
+            )
+            self.session_hand_table.setSortingEnabled(
+                True
+            )
+            self.session_hands_label.setText(
+                "Could not load this session's hands"
+            )
+            QMessageBox.warning(
+                self,
+                "Session hands",
+                "The selected session's hands could not be loaded.\n\n"
+                "Make sure both ui.py and database.py are from the "
+                "same download.\n\n"
+                f"{type(exc).__name__}: {exc}",
+            )
+            return
+
+        if not sessions:
+            self.session_hands_label.setText(
+                "Select a session to view its hands"
+            )
+        elif len(sessions) == 1:
+            session = sessions[0]
+            self.session_hands_label.setText(
+                "Hands in session · "
+                f"{session['start']:%Y-%m-%d %H:%M}–"
+                f"{session['end']:%H:%M} · "
+                f"{len(rows)} hand"
+                f"{'s' if len(rows) != 1 else ''}"
+            )
+        else:
+            self.session_hands_label.setText(
+                f"Hands in {len(sessions)} selected sessions · "
+                f"{len(rows)} hands"
+            )
+
+        if rows:
+            self.session_hand_table.selectRow(
+                0
+            )
 
     def delete_selected_sessions(self):
         rows = sorted(
