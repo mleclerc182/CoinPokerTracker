@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
-from PySide6.QtCore import QDate, QLocale, QSettings, Qt, Signal, QThread
+from PySide6.QtCore import QDate, QLocale, QPoint, QSettings, Qt, Signal, QThread
 from PySide6.QtGui import QAction, QColor, QDoubleValidator, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCalendarWidget, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
     QPushButton, QSplitter, QStyledItemDelegate, QStyle, QStyleOptionViewItem, QTabWidget, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget
+    QTableWidgetItem, QToolTip, QVBoxLayout, QWidget
 )
 from .database import TrackerDB
 from .equity import evaluator_available
@@ -50,6 +51,9 @@ CARD_ACCENTS = {
     "Splash hands": "#fb7185",
     "RIT hands": "#a78bfa",
 }
+
+DEFAULT_HAND_LIMIT = 1000
+HAND_LIMIT_OPTIONS = (500, 1000, 2500, 5000, 10000, -1)
 
 HAND_TABLE_HEADERS = [
     "Date",
@@ -138,6 +142,22 @@ def fmt_money(cents: int) -> str:
 
 def fmt_pct(x: float) -> str:
     return f"{x:.1f}%"
+
+
+def parse_hand_limit(text: str) -> int:
+    """Parse a positive count (with optional thousands separators) or All."""
+    text = text.strip()
+    if text.casefold() == "all":
+        return -1
+    if not re.fullmatch(r"(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)", text):
+        raise ValueError("Enter a positive whole number, such as 3,500, or choose All.")
+    digits = text.replace(",", "").lstrip("0")
+    # Keep custom counts within Qt's signed-integer range; All has no cap.
+    if len(digits) > 10 or (digits and int(digits) > 2_147_483_647):
+        raise ValueError("That amount is too large. Choose All to load every matching hand.")
+    if not digits:
+        raise ValueError("Enter at least 1 hand, or choose All.")
+    return int(digits)
 
 
 class StatCard(QFrame):
@@ -2270,6 +2290,168 @@ class MainWindow(QMainWindow):
                 WINNING_TEXT_COLOR if value > 0 else LOSING_TEXT_COLOR
             ))
 
+    @staticmethod
+    def _add_hand_limit_control(layout: QHBoxLayout, reload_hands, context: str):
+        label = QLabel("Show hands:")
+
+        # Build this like OptionalDatePicker: field on the left,
+        # dedicated ▼ button on the right.
+        control = QWidget()
+        control_layout = QHBoxLayout(control)
+        control_layout.setContentsMargins(0, 0, 0, 0)
+        control_layout.setSpacing(0)
+
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.NoInsert)
+        combo.setCompleter(None)
+        combo.setMinimumWidth(120)
+        combo.setAccessibleName(f"{context} hand display limit")
+        combo.setToolTip(
+            "Choose a preset or type a positive hand count (for example, 3,500). "
+            "Press Enter or leave the field to load the latest matching hands. "
+            "Current filters apply; column headings sort the loaded hands."
+        )
+
+        # Hide the combo's native drop-down area so the dedicated button is
+        # the only arrow, matching OptionalDatePicker's split-field appearance.
+        combo.setStyleSheet(
+            """
+            QComboBox {
+                border-top-right-radius: 0;
+                border-bottom-right-radius: 0;
+                padding-right: 6px;
+            }
+
+            QComboBox::drop-down {
+                border: none;
+                width: 0px;
+            }
+
+            QComboBox::down-arrow {
+                width: 0px;
+                height: 0px;
+            }
+            """
+        )
+
+        editor = combo.lineEdit()
+        editor.setStyleSheet(
+            """
+            QLineEdit {
+                border: none;
+                background: transparent;
+                padding: 0;
+            }
+            """
+        )
+
+        drop_button = QPushButton("▼")
+        drop_button.setFixedWidth(30)
+        drop_button.setToolTip("Show preset hand counts")
+        drop_button.setFocusPolicy(Qt.NoFocus)
+        drop_button.clicked.connect(combo.showPopup)
+        drop_button.setStyleSheet(
+            """
+            QPushButton {
+                border-top-left-radius: 0;
+                border-bottom-left-radius: 0;
+                padding: 5px 4px;
+                font-size: 9pt;
+            }
+            """
+        )
+
+        control_layout.addWidget(combo, 1)
+        control_layout.addWidget(drop_button)
+
+        for limit in HAND_LIMIT_OPTIONS:
+            combo.addItem("All" if limit < 0 else f"{limit:,}", limit)
+
+        combo.setCurrentIndex(combo.findData(DEFAULT_HAND_LIMIT))
+
+        label.setBuddy(combo)
+        layout.addWidget(label)
+        layout.addWidget(control)
+
+        # Keep convenient references alive/accessible from the returned combo.
+        combo._drop_button = drop_button
+        combo._split_control = control
+
+        applied_limit = DEFAULT_HAND_LIMIT
+        custom_index = None
+
+        def apply_limit(limit: int):
+            nonlocal applied_limit, custom_index
+
+            text = "All" if limit < 0 else f"{limit:,}"
+            was_blocked = combo.blockSignals(True)
+            editor_was_blocked = editor.blockSignals(True)
+
+            try:
+                index = combo.findData(limit)
+
+                if index < 0:
+                    # Keep one reusable custom choice immediately before "All".
+                    if custom_index is None:
+                        custom_index = combo.findData(-1)
+                        combo.insertItem(custom_index, text, limit)
+                    else:
+                        combo.setItemText(custom_index, text)
+                        combo.setItemData(custom_index, limit)
+
+                    index = custom_index
+
+                combo.setCurrentIndex(index)
+                combo.setEditText(text)
+            finally:
+                editor.blockSignals(editor_was_blocked)
+                combo.blockSignals(was_blocked)
+
+            QToolTip.hideText()
+
+            changed = limit != applied_limit
+            applied_limit = limit
+
+            if changed:
+                reload_hands()
+
+        def select_limit(index: int):
+            if index < 0:
+                return
+
+            limit = combo.itemData(index)
+
+            if isinstance(limit, int) and (limit > 0 or limit == -1):
+                apply_limit(limit)
+
+        def commit_text():
+            try:
+                limit = parse_hand_limit(combo.currentText())
+            except ValueError as exc:
+                apply_limit(applied_limit)
+                QToolTip.showText(
+                    combo.mapToGlobal(QPoint(0, combo.height())),
+                    str(exc),
+                    combo,
+                )
+                return
+
+            apply_limit(limit)
+
+        combo.currentIndexChanged.connect(select_limit)
+        # Activation also handles reselecting the current preset after typing.
+        combo.activated.connect(select_limit)
+        editor.editingFinished.connect(commit_text)
+
+        return combo
+
+    @staticmethod
+    def _hand_count_text(shown: int, total: int) -> str:
+        if shown < total:
+            return f"Showing latest {shown:,} of {total:,} hands"
+        return f"Showing {shown:,} of {total:,} hand{'s' if total != 1 else ''}"
+
     def _build_hands(self):
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -2300,6 +2482,16 @@ class MainWindow(QMainWindow):
         toolbar.addStretch(1)
 
         lay.addLayout(toolbar)
+        hand_controls = QHBoxLayout()
+        self.hands_count_label = QLabel()
+        self.hands_count_label.setStyleSheet("color: #9fc5f8;")
+        hand_controls.addWidget(self.hands_count_label, 1)
+        self.hand_limit_combo = self._add_hand_limit_control(
+            hand_controls,
+            lambda: self.refresh_hands(self.filters.filters()),
+            "Hands",
+        )
+        lay.addLayout(hand_controls)
 
         split = QSplitter(
             Qt.Vertical
@@ -2498,9 +2690,13 @@ class MainWindow(QMainWindow):
         self.session_hands_label.setStyleSheet(
             "color: #9fc5f8; font-weight: 700;"
         )
-        hands_layout.addWidget(
-            self.session_hands_label
+        self.session_hands_label.setWordWrap(True)
+        hand_controls = QHBoxLayout()
+        hand_controls.addWidget(self.session_hands_label, 1)
+        self.session_hand_limit_combo = self._add_hand_limit_control(
+            hand_controls, self.show_selected_session_hands, "Session",
         )
+        hands_layout.addLayout(hand_controls)
 
         self.session_hand_table = QTableWidget(
             0,
@@ -2631,7 +2827,12 @@ class MainWindow(QMainWindow):
         self.group_hands_label = QLabel("Select a group to view its hands")
         self.group_hands_label.setStyleSheet("color: #9fc5f8; font-weight: 700;")
         self.group_hands_label.setWordWrap(True)
-        hands_layout.addWidget(self.group_hands_label)
+        hand_controls = QHBoxLayout()
+        hand_controls.addWidget(self.group_hands_label, 1)
+        self.group_hand_limit_combo = self._add_hand_limit_control(
+            hand_controls, self.show_selected_group_hands, "Group",
+        )
+        hands_layout.addLayout(hand_controls)
 
         self.group_hand_table = QTableWidget(0, len(HAND_TABLE_HEADERS))
         self.group_hand_table.setHorizontalHeaderLabels(HAND_TABLE_HEADERS)
@@ -3227,7 +3428,10 @@ class MainWindow(QMainWindow):
         self,
         f,
     ):
-        rows = self.db.hands(f)
+        rows = self.db.hands(f, limit=self.hand_limit_combo.currentData())
+        self.hands_count_label.setText(
+            self._hand_count_text(len(rows), self.db.hand_count(f))
+        )
         self._populate_hand_table(
             self.hand_table,
             rows,
@@ -3474,7 +3678,7 @@ class MainWindow(QMainWindow):
         )
         try:
             rows = self.db.hands_by_ids(
-                hand_ids
+                hand_ids, limit=self.session_hand_limit_combo.currentData(),
             )
 
             self.session_hand_table.setSortingEnabled(
@@ -3520,13 +3724,12 @@ class MainWindow(QMainWindow):
                 "Hands in session · "
                 f"{session['start']:%Y-%m-%d %H:%M}–"
                 f"{session['end']:%H:%M} · "
-                f"{len(rows)} hand"
-                f"{'s' if len(rows) != 1 else ''}"
+                + self._hand_count_text(len(rows), len(hand_ids))
             )
         else:
             self.session_hands_label.setText(
                 f"Hands in {len(sessions)} selected sessions · "
-                f"{len(rows)} hands"
+                + self._hand_count_text(len(rows), len(hand_ids))
             )
 
         if rows:
@@ -3702,7 +3905,10 @@ class MainWindow(QMainWindow):
         table.setSortingEnabled(False)
         try:
             rows = (
-                self.db.hands_for_group(*self._selected_group_key, filters=self._group_filters)
+                self.db.hands_for_group(
+                    *self._selected_group_key, filters=self._group_filters,
+                    limit=self.group_hand_limit_combo.currentData(),
+                )
                 if self._selected_group_key is not None else []
             )
             self._populate_hand_table(table, rows)
@@ -3711,7 +3917,7 @@ class MainWindow(QMainWindow):
             else:
                 label = "All filtered hands" if group is self._group_total else group["group"]
                 self.group_hands_label.setText(
-                    f"{label} · {len(rows):,} hand{'s' if len(rows) != 1 else ''}"
+                    f"{label} · {self._hand_count_text(len(rows), group['hands'])}"
                     " · Double-click a hand to open the replayer"
                 )
         except Exception as exc:
@@ -3818,3 +4024,4 @@ class MainWindow(QMainWindow):
             }:
                 self._apply_result_color(item, value)
             self.group_table.setItem(row_index, column, item)
+

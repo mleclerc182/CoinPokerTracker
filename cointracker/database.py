@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict
+from heapq import nlargest
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
@@ -801,16 +802,28 @@ class TrackerDB:
         return [(r[0], r[1]) for r in self.conn.execute(
             "SELECT DISTINCT sb_cents, bb_cents FROM hands ORDER BY bb_cents, sb_cents"
         ).fetchall()]
-    def hands(self, filters: dict | None = None, limit: int = 2000) -> list[sqlite3.Row]:
+    def hand_count(self, filters: dict | None = None) -> int:
+        """Count all matching hands independently of the display limit."""
         where, params = self._where(filters)
-        params = list(params) + [limit]
+        return self.conn.execute(
+            f"SELECT COUNT(*) FROM hands{where}", params,
+        ).fetchone()[0]
+
+    def hands(self, filters: dict | None = None, limit: int = 1000) -> list[sqlite3.Row]:
+        """Return the latest matching hands; a negative limit returns all."""
+        where, params = self._where(filters)
+        return self._query_hands(where, params, limit)
+
+    def _query_hands(self, where: str, params: Iterable, limit: int) -> list[sqlite3.Row]:
+        """Fetch the shared hand-table columns after applying a SQL condition."""
         return self.conn.execute(
             f"""SELECT hand_id, started_at, sb_cents, bb_cents, hero_position, hero_cards,
                 board1, board2, board3, run_count, splash_type, splash_cents,
                 total_pot_cents, rake_cents, hero_contributed_cents,
                 hero_returned_cents, hero_splash_won_cents, hero_net_cents,
                 hero_allin_adj_cents, hero_allin_equity, hero_allin_adjusted, hero_allin_estimated
-                FROM hands{where} ORDER BY started_at DESC, hand_id DESC LIMIT ?""", params
+                FROM hands{where} ORDER BY started_at DESC, hand_id DESC LIMIT ?""",
+            [*params, limit],
         ).fetchall()
 
     def hands_for_group(
@@ -818,17 +831,19 @@ class TrackerDB:
         group_by: str,
         group_key: str | tuple[int, int] | None,
         filters: dict | None = None,
+        limit: int = -1,
     ) -> list[sqlite3.Row]:
-        """Return every filtered hand in a group; None selects the total row.
+        """Return the latest filtered hands in a group; None selects the total.
 
         Use the same position normalization and starting-hand categories as
         grouped_results. Add the group condition to the active filters rather
-        than replacing a potentially narrower existing filter.
+        than replacing a potentially narrower existing filter. A negative
+        limit returns all matching hands.
         """
         if group_by not in {"position", "stakes", "starting_hands"}:
             raise ValueError(f"Unsupported grouping: {group_by}")
         if group_key is None:
-            return self.hands(filters, limit=-1)
+            return self.hands(filters, limit=limit)
 
         where, params = self._where(filters)
         if group_by == "stakes":
@@ -843,12 +858,38 @@ class TrackerDB:
             condition = "COALESCE(NULLIF(TRIM(hero_position), ''), 'Unknown') = ?"
             params.append(group_key)
         where += (" AND " if where else " WHERE ") + condition
-        hand_ids = self.conn.execute(f"SELECT hand_id FROM hands{where}", params)
-        return self.hands_by_ids(row[0] for row in hand_ids)
+        return self._query_hands(where, params, limit)
 
-    def hands_by_ids(self, hand_ids: Iterable[str]) -> list[sqlite3.Row]:
-        """Return full Hands-tab rows for an explicit set of stored hand IDs."""
+    def hands_by_ids(
+        self, hand_ids: Iterable[str], limit: int = -1,
+    ) -> list[sqlite3.Row]:
+        """Return the latest stored hands in an ID set; a negative limit returns all.
+
+        Select by date across the entire set before loading full hand rows.
+        This keeps a large session selection from loading every hand when the
+        user only wants to display its most recent 1,000.
+        """
+        if limit == 0:
+            return []
         ids = list(dict.fromkeys(str(hand_id) for hand_id in hand_ids if hand_id))
+        if limit > 0 and len(ids) > limit:
+            def candidates():
+                for index in range(0, len(ids), 800):
+                    chunk = ids[index:index + 800]
+                    marks = ",".join("?" for _ in chunk)
+                    yield from self.conn.execute(
+                        f"""SELECT hand_id, started_at FROM hands
+                            WHERE hand_id IN ({marks})
+                            ORDER BY started_at DESC, hand_id DESC LIMIT ?""",
+                        [*chunk, limit],
+                    )
+
+            ids = [
+                row["hand_id"] for row in nlargest(
+                    limit, candidates(),
+                    key=lambda row: (row["started_at"], row["hand_id"]),
+                )
+            ]
         if not ids:
             return []
 
@@ -857,17 +898,7 @@ class TrackerDB:
             chunk = ids[index:index + 800]
             marks = ",".join("?" for _ in chunk)
             rows.extend(
-                self.conn.execute(
-                    f"""SELECT hand_id, started_at, sb_cents, bb_cents,
-                        hero_position, hero_cards, board1, board2, board3,
-                        run_count, splash_type, splash_cents, total_pot_cents,
-                        rake_cents, hero_contributed_cents, hero_returned_cents,
-                        hero_splash_won_cents, hero_net_cents,
-                        hero_allin_adj_cents, hero_allin_equity,
-                        hero_allin_adjusted, hero_allin_estimated
-                        FROM hands WHERE hand_id IN ({marks})""",
-                    chunk,
-                ).fetchall()
+                self._query_hands(f" WHERE hand_id IN ({marks})", chunk, -1)
             )
         return sorted(
             rows,
