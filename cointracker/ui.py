@@ -4,7 +4,7 @@ import json
 import os
 import re
 from pathlib import Path
-from PySide6.QtCore import QDate, QLocale, QPoint, QSettings, Qt, Signal, QThread
+from PySide6.QtCore import QDate, QItemSelectionModel, QLocale, QPoint, QSettings, Qt, Signal, QThread
 from PySide6.QtGui import QAction, QColor, QDoubleValidator, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCalendarWidget, QCheckBox, QComboBox, QDialog,
@@ -2789,7 +2789,7 @@ class MainWindow(QMainWindow):
         self.group_table = QTableWidget(0, 0)
         self.group_table.setAlternatingRowColors(True)
         self.group_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.group_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.group_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.group_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.group_table.verticalHeader().setVisible(False)
         header = self.group_table.horizontalHeader()
@@ -2811,7 +2811,7 @@ class MainWindow(QMainWindow):
         self._group_rows = []
         self._group_total = {}
         self._group_display_rows = []
-        self._selected_group_key = None
+        self._selected_group_keys = set()
         self._group_filters = {}
         header.sectionClicked.connect(self._sort_groups_by_column)
         self.group_by_combo.currentIndexChanged.connect(
@@ -3820,8 +3820,10 @@ class MainWindow(QMainWindow):
         group_by = self.group_by_combo.currentData()
         if filters is None:
             filters = self.filters.filters()
-        if self._selected_group_key is not None and self._selected_group_key[0] != group_by:
-            self._selected_group_key = None
+        self._selected_group_keys = {
+            key for key in self._selected_group_keys
+            if key[0] == group_by
+        }
         self._group_filters = dict(filters)
         self._group_rows, self._group_total = self.db.grouped_results(group_by, filters)
         if group_by == "stakes":
@@ -3835,7 +3837,7 @@ class MainWindow(QMainWindow):
             f"{self._group_total['hands']:,} hands · {len(self._group_rows):,} groups"
         )
         hint = (
-            "Current filters apply. Select a group to view its hands below. "
+            "Current filters apply. Select one or more groups to view their hands below. "
             "Click a heading to sort; drag headings to reorder or edges to resize."
         )
         if group_by == "starting_hands":
@@ -3893,39 +3895,110 @@ class MainWindow(QMainWindow):
         return (group_by, row["group"])
 
     def show_selected_group_hands(self):
-        selected = self.group_table.selectionModel().selectedRows()
-        index = selected[0].row() if selected else -1
-        group = (
-            self._group_display_rows[index]
-            if 0 <= index < len(self._group_display_rows) else None
+        selected_rows = sorted(
+            {
+                index.row()
+                for index
+                in self.group_table
+                .selectionModel()
+                .selectedRows()
+            }
         )
-        self._selected_group_key = self._group_row_key(group) if group is not None else None
+        groups = [
+            self._group_display_rows[row]
+            for row in selected_rows
+            if 0 <= row < len(self._group_display_rows)
+        ]
+        self._selected_group_keys = {
+            self._group_row_key(group)
+            for group in groups
+        }
+
         table = self.group_hand_table
         table.setUpdatesEnabled(False)
         table.setSortingEnabled(False)
         try:
-            rows = (
-                self.db.hands_for_group(
-                    *self._selected_group_key, filters=self._group_filters,
-                    limit=self.group_hand_limit_combo.currentData(),
-                )
-                if self._selected_group_key is not None else []
+            limit = self.group_hand_limit_combo.currentData()
+            total_selected = any(
+                group is self._group_total
+                for group in groups
             )
-            self._populate_hand_table(table, rows)
-            if group is None:
-                self.group_hands_label.setText("Select a group to view its hands")
+
+            if not groups:
+                rows = []
+                expected_hands = 0
+            elif total_selected:
+                rows = self.db.hands_for_group(
+                    self.group_by_combo.currentData(),
+                    None,
+                    filters=self._group_filters,
+                    limit=limit,
+                )
+                expected_hands = self._group_total["hands"]
             else:
-                label = "All filtered hands" if group is self._group_total else group["group"]
+                per_group_limit = limit if limit > 0 else -1
+                hand_ids = list(
+                    dict.fromkeys(
+                        row["hand_id"]
+                        for group in groups
+                        for row in self.db.hands_for_group(
+                            *self._group_row_key(group),
+                            filters=self._group_filters,
+                            limit=per_group_limit,
+                        )
+                    )
+                )
+                rows = self.db.hands_by_ids(
+                    hand_ids,
+                    limit=limit,
+                )
+                expected_hands = sum(
+                    group["hands"]
+                    for group in groups
+                )
+
+            self._populate_hand_table(table, rows)
+            if not groups:
                 self.group_hands_label.setText(
-                    f"{label} · {self._hand_count_text(len(rows), group['hands'])}"
-                    " · Double-click a hand to open the replayer"
+                    "Select one or more groups to view their hands"
+                )
+            elif total_selected:
+                self.group_hands_label.setText(
+                    "All filtered hands · "
+                    + self._hand_count_text(
+                        len(rows),
+                        expected_hands,
+                    )
+                    + " · Double-click a hand to open the replayer"
+                )
+            elif len(groups) == 1:
+                self.group_hands_label.setText(
+                    f"{groups[0]['group']} · "
+                    + self._hand_count_text(
+                        len(rows),
+                        expected_hands,
+                    )
+                    + " · Double-click a hand to open the replayer"
+                )
+            else:
+                self.group_hands_label.setText(
+                    f"Hands in {len(groups)} selected groups · "
+                    + self._hand_count_text(
+                        len(rows),
+                        expected_hands,
+                    )
+                    + " · Double-click a hand to open the replayer"
                 )
         except Exception as exc:
             table.setRowCount(0)
-            self.group_hands_label.setText("Could not load the selected group's hands")
+            self.group_hands_label.setText(
+                "Could not load the selected groups' hands"
+            )
             QMessageBox.warning(
-                self, "Group hands",
-                f"The selected group's hands could not be loaded.\n\n{exc}",
+                self,
+                "Group hands",
+                "The selected groups' hands could not be loaded.\n\n"
+                f"{type(exc).__name__}: {exc}",
             )
         finally:
             # Re-enabling sorting reapplies the user's current column/order.
@@ -3973,20 +4046,40 @@ class MainWindow(QMainWindow):
             reverse=order == Qt.DescendingOrder,
         )
         self._group_display_rows = [*rows, self._group_total]
+        selected_keys = set(self._selected_group_keys)
         was_blocked = self.group_table.blockSignals(True)
         try:
             self.group_table.horizontalHeader().setSortIndicator(columns.index(key), order)
             self.group_table.setRowCount(0)
             self.group_table.setRowCount(len(self._group_display_rows))
-            selected_row = None
+            selected_rows = []
             for row_index, row in enumerate(self._group_display_rows):
-                if self._group_row_key(row) == self._selected_group_key:
-                    selected_row = row_index
                 self._populate_group_summary_row(row_index, row, columns)
-            if selected_row is not None:
-                self.group_table.selectRow(selected_row)
-            else:
-                self._selected_group_key = None
+                if self._group_row_key(row) in selected_keys:
+                    selected_rows.append(row_index)
+
+            selection_model = self.group_table.selectionModel()
+            selection_model.clearSelection()
+            model = self.group_table.model()
+            flags = (
+                QItemSelectionModel.SelectionFlag.Select
+                | QItemSelectionModel.SelectionFlag.Rows
+            )
+            for row_index in selected_rows:
+                selection_model.select(
+                    model.index(row_index, 0),
+                    flags,
+                )
+
+            self._selected_group_keys = {
+                self._group_row_key(self._group_display_rows[row_index])
+                for row_index in selected_rows
+            }
+            if selected_rows:
+                selection_model.setCurrentIndex(
+                    model.index(selected_rows[0], 0),
+                    QItemSelectionModel.SelectionFlag.NoUpdate,
+                )
         finally:
             self.group_table.blockSignals(was_blocked)
 
@@ -4024,4 +4117,3 @@ class MainWindow(QMainWindow):
             }:
                 self._apply_result_color(item, value)
             self.group_table.setItem(row_index, column, item)
-

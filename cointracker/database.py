@@ -273,7 +273,7 @@ class TrackerDB:
             WHERE street = 'PREFLOP' AND raise_number = 2
               AND aggressive = 1 AND action IN ('RAISE', 'ALLIN')"""
         with self._database_update_progress(
-            0, 2, "Repairing 3-bet statistics…\nUpdating hand summaries (step 1 of 2).",
+            0, 2, "Repairing Database statistics…\nUpdating hand summaries (step 1 of 2).",
         ) as report_progress, self.conn:
             self.conn.execute(
                 f"""UPDATE hands SET hero_three_bet =
@@ -281,7 +281,7 @@ class TrackerDB:
             )
             report_progress(
                 1,
-                "Repairing 3-bet statistics…\nUpdating player results (step 2 of 2).",
+                "Repairing Database statistics…\nUpdating player results (step 2 of 2).",
             )
             self.conn.execute(
                 f"""UPDATE player_results SET three_bet =
@@ -354,20 +354,20 @@ class TrackerDB:
         with self._database_update_progress(
             0,
             len(queries),
-            "Checking 3-bet statistics…\nStarting regression check 1 of 4.",
+            "Checking Database statistics…\nStarting regression check 1 of 4.",
             finish=False,
         ) as report_progress:
             for index, (description, query) in enumerate(queries, 1):
                 report_progress(
                     index - 1,
-                    "Checking 3-bet statistics…\n"
+                    "Checking Database statistics…\n"
                     f"Checking {description} ({index} of {len(queries)}).",
                 )
                 if self.conn.execute(query).fetchone():
                     return True
                 report_progress(
                     index,
-                    "Checking 3-bet statistics…\n"
+                    "Checking Datanase statistics…\n"
                     f"Completed regression check {index} of {len(queries)}.",
                 )
         return False
