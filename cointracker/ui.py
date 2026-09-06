@@ -16,7 +16,10 @@ from .database import TrackerDB
 from .equity import evaluator_available
 from .importer import import_file, import_folder
 from .graphing import hand_tick_step, hand_ticks, money_axis_bounds, nice_step
-from .handtable import card_text_segments, hole_card_sort_key, normalize_hole_cards
+from .handtable import (
+    card_text_segments, hole_card_sort_key, normalize_hole_cards,
+    starting_hand_sort_key,
+)
 from .replay import build_replay
 from .replayer import HandReplayerDialog
 
@@ -61,12 +64,70 @@ HAND_TABLE_HEADERS = [
     "Pot",
     "Hero Contrib (BB)",
     "Net Won",
+    "BB Won",
     "AI Eq",
+    "AI Adj Net Won",
     "AI Adj BB",
 ]
 HERO_CONTRIB_COLUMN = HAND_TABLE_HEADERS.index(
     "Hero Contrib (BB)"
 )
+NET_WON_COLUMN = HAND_TABLE_HEADERS.index("Net Won")
+BB_WON_COLUMN = HAND_TABLE_HEADERS.index("BB Won")
+AI_ADJ_NET_WON_COLUMN = HAND_TABLE_HEADERS.index("AI Adj Net Won")
+AI_ADJ_BB_COLUMN = HAND_TABLE_HEADERS.index("AI Adj BB")
+
+WINNING_TEXT_COLOR = "#4ade80"
+LOSING_TEXT_COLOR = "#ff667d"
+
+HAND_TABLE_TOOLTIPS = {
+    "Hero Contrib (BB)": (
+        "Hero's total contribution after returned chips, divided by the big blind"
+    ),
+    "Net Won": "Hero's net winnings in CoinPoker currency",
+    "BB Won": "Hero's net winnings divided by this hand's big blind",
+    "AI Eq": "Hero's all-in equity when an all-in adjustment was calculated",
+    "AI Adj Net Won": (
+        "All-in adjusted net winnings; equals Net Won when no adjustment applies. "
+        "~ marks an estimated calculation"
+    ),
+    "AI Adj BB": (
+        "All-in adjusted net winnings divided by this hand's big blind; "
+        "~ marks an estimated calculation"
+    ),
+}
+
+GROUP_BY_COLUMNS = {
+    "position": (
+        "group", "hands", "net_cents", "bb100", "vpip", "pfr",
+        "three_bet", "wwsf", "wtsd", "wsd", "allin_adj_cents", "allin_adj_bb100",
+    ),
+    "stakes": (
+        "group", "hands", "net_cents", "net_bb", "bb100",
+        "allin_adj_cents", "allin_adj_bb100", "splash_won_cents", "vpip", "pfr", "three_bet",
+    ),
+    "starting_hands": (
+        "group", "hand_type", "hands", "share_pct", "net_cents", "bb100",
+        "allin_adj_cents", "allin_adj_bb100", "vpip", "pfr", "three_bet",
+    ),
+}
+GROUP_COLUMN_DETAILS = {
+    "hands": ("Hands", "integer", "Number of hands matching the current filters"),
+    "hand_type": ("Type", "text", "Pair, suited, offsuit, or another card format"),
+    "share_pct": ("% Hands", "percent", "Share of all hands matching the current filters"),
+    "net_cents": ("Net Won", "money", "Winnings before manually entered rakeback"),
+    "net_bb": ("BB Won", "number", "Sum of each hand's winnings in its own big blinds"),
+    "bb100": ("bb/100", "number", "Big blinds won per 100 hands"),
+    "allin_adj_cents": ("AI Adj Net Won", "money", "All-in adjusted net winnings"),
+    "allin_adj_bb100": ("Adj bb/100", "number", "All-in adjusted big blinds per 100 hands"),
+    "splash_won_cents": ("Splash Won", "money", "Splash money won by Hero"),
+    "vpip": ("VPIP", "percent", "Voluntarily put money in the pot / hands"),
+    "pfr": ("PFR", "percent", "Preflop raises / hands"),
+    "three_bet": ("3-Bet", "percent", "Preflop 3-bets / 3-bet opportunities"),
+    "wwsf": ("WWSF", "percent", "Hands won after seeing a flop / flops seen"),
+    "wtsd": ("WTSD", "percent", "Showdowns / flops seen"),
+    "wsd": ("W$SD", "percent", "Showdowns won / showdowns"),
+}
 
 
 def fmt_money(cents: int) -> str:
@@ -1203,6 +1264,7 @@ class FiltersBar(QWidget):
         db: TrackerDB,
     ):
         old = self.stakes.currentData()
+        old_sb = self.stakes.currentData(Qt.UserRole + 1)
 
         self.stakes.blockSignals(True)
         self.stakes.clear()
@@ -1216,11 +1278,17 @@ class FiltersBar(QWidget):
                 f"{fmt_money(sb)}/{fmt_money(bb)}",
                 bb,
             )
+            self.stakes.setItemData(
+                self.stakes.count() - 1, sb, Qt.UserRole + 1,
+            )
 
-        idx = self.stakes.findData(old)
-
-        if idx >= 0:
-            self.stakes.setCurrentIndex(idx)
+        for index in range(self.stakes.count()):
+            if (
+                self.stakes.itemData(index) == old
+                and self.stakes.itemData(index, Qt.UserRole + 1) == old_sb
+            ):
+                self.stakes.setCurrentIndex(index)
+                break
 
         self.stakes.blockSignals(False)
 
@@ -1242,6 +1310,7 @@ class FiltersBar(QWidget):
             f["bb_cents"] = int(
                 self.stakes.currentData()
             )
+            f["sb_cents"] = int(self.stakes.currentData(Qt.UserRole + 1))
         f["splash"] = {
             1: "only",
             2: "exclude",
@@ -1482,7 +1551,7 @@ class MainWindow(QMainWindow):
         self._build_overview()
         self._build_hands()
         self._build_sessions()
-        self._build_positions()
+        self._build_group_by()
         self._build_menu()
 
         self.refresh_all()
@@ -2166,6 +2235,41 @@ class MainWindow(QMainWindow):
                 checked,
             )
 
+    @staticmethod
+    def _configure_table_columns(table: QTableWidget):
+        """Set initial widths once, leaving later layout changes to the user."""
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(40)
+        header.setSectionsMovable(True)
+        header.setSectionsClickable(True)
+        header.setToolTip(
+            "Click a heading to sort; drag headings to reorder or edges to resize."
+        )
+        table.resizeColumnsToContents()
+        initial_widths = {
+            "Date": 165, "Start": 165, "End": 165, "Hand": 115,
+            "Stakes": 125, "Pos": 65, "Cards": 110, "Board(s)": 280,
+            "Net Won": 105, "BB Won": 90, "AI Adj Net Won": 125,
+        }
+        for column in range(table.columnCount()):
+            header_item = table.horizontalHeaderItem(column)
+            name = header_item.text()
+            tooltip = HAND_TABLE_TOOLTIPS.get(name)
+            if tooltip:
+                header_item.setToolTip(tooltip)
+            table.setColumnWidth(
+                column, max(table.columnWidth(column), initial_widths.get(name, 90)),
+            )
+
+    @staticmethod
+    def _apply_result_color(item: QTableWidgetItem, value: float):
+        if value:
+            item.setForeground(QColor(
+                WINNING_TEXT_COLOR if value > 0 else LOSING_TEXT_COLOR
+            ))
+
     def _build_hands(self):
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -2208,23 +2312,11 @@ class MainWindow(QMainWindow):
         self.hand_table.setHorizontalHeaderLabels(
             HAND_TABLE_HEADERS
         )
-        self.hand_table.horizontalHeaderItem(
-            HERO_CONTRIB_COLUMN
-        ).setToolTip(
-            "Hero's total contribution after returned chips, divided by the big blind"
-        )
 
+        self._configure_table_columns(self.hand_table)
         header = (
             self.hand_table
             .horizontalHeader()
-        )
-        header.setSectionResizeMode(
-            QHeaderView.ResizeToContents
-        )
-
-        header.setSectionResizeMode(
-            5,
-            QHeaderView.Stretch,
         )
 
         header.setSortIndicatorShown(
@@ -2349,12 +2441,18 @@ class MainWindow(QMainWindow):
                 "Duration",
                 "Hands",
                 "Net Won",
-                "BB won",
+                "BB Won",
             ]
         )
-        self.session_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.Stretch
+        self._configure_table_columns(self.session_table)
+        self.session_table.horizontalHeaderItem(4).setToolTip(
+            "Combined net winnings for the hands in this session"
         )
+        self.session_table.horizontalHeaderItem(5).setToolTip(
+            "Sum of each hand's net winnings divided by its own big blind"
+        )
+        self.session_table.horizontalHeader().setSortIndicator(0, Qt.DescendingOrder)
+        self.session_table.setSortingEnabled(True)
 
         self.session_table.setAlternatingRowColors(
             True
@@ -2411,21 +2509,10 @@ class MainWindow(QMainWindow):
         self.session_hand_table.setHorizontalHeaderLabels(
             HAND_TABLE_HEADERS
         )
-        self.session_hand_table.horizontalHeaderItem(
-            HERO_CONTRIB_COLUMN
-        ).setToolTip(
-            "Hero's total contribution after returned chips, divided by the big blind"
-        )
+        self._configure_table_columns(self.session_hand_table)
         session_hand_header = (
             self.session_hand_table
             .horizontalHeader()
-        )
-        session_hand_header.setSectionResizeMode(
-            QHeaderView.ResizeToContents
-        )
-        session_hand_header.setSectionResizeMode(
-            5,
-            QHeaderView.Stretch,
         )
         session_hand_header.setSortIndicator(
             0,
@@ -2479,44 +2566,93 @@ class MainWindow(QMainWindow):
             "Sessions",
         )
 
-    def _build_positions(self):
+    def _build_group_by(self):
         w = QWidget()
         lay = QVBoxLayout(w)
+        toolbar = QHBoxLayout()
+        group_label = QLabel("Group by:")
+        self.group_by_combo = QComboBox()
+        self.group_by_combo.setMinimumWidth(180)
+        self.group_by_combo.setAccessibleName("Group results by")
+        self.group_by_combo.addItem("Position", "position")
+        self.group_by_combo.addItem("Stakes", "stakes")
+        self.group_by_combo.addItem("Starting Hands", "starting_hands")
+        group_label.setBuddy(self.group_by_combo)
+        toolbar.addWidget(group_label)
+        toolbar.addWidget(self.group_by_combo)
+        toolbar.addStretch(1)
+        self.group_count_label = QLabel()
+        toolbar.addWidget(self.group_count_label)
+        lay.addLayout(toolbar)
 
-        self.pos_table = QTableWidget(
-            0,
-            6,
-        )
-        self.pos_table.setHorizontalHeaderLabels(
-            [
-                "Position",
-                "Hands",
-                "Net Won",
-                "bb/100",
-                "VPIP",
-                "PFR",
-            ]
-        )
+        self.group_hint = QLabel()
+        self.group_hint.setWordWrap(True)
+        self.group_hint.setStyleSheet("color: #8fa9c9;")
+        lay.addWidget(self.group_hint)
 
-        self.pos_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.Stretch
+        self.group_table = QTableWidget(0, 0)
+        self.group_table.setAlternatingRowColors(True)
+        self.group_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.group_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.group_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.group_table.verticalHeader().setVisible(False)
+        header = self.group_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(40)
+        header.setSectionsMovable(True)
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
+        self._group_column_mode = None
+        self._group_column_states = {}
+        # Sort the cached data ourselves so the total remains the last row
+        # in both directions. Header clicks do not query the database again.
+        self._group_sorts = {
+            "position": ("group", Qt.AscendingOrder),
+            "stakes": ("group", Qt.AscendingOrder),
+            "starting_hands": ("group", Qt.DescendingOrder),
+        }
+        self._group_rows = []
+        self._group_total = {}
+        self._group_display_rows = []
+        self._selected_group_key = None
+        self._group_filters = {}
+        header.sectionClicked.connect(self._sort_groups_by_column)
+        self.group_by_combo.currentIndexChanged.connect(
+            lambda _index: self.refresh_group_by()
         )
+        self.group_table.itemSelectionChanged.connect(self.show_selected_group_hands)
 
-        self.pos_table.setAlternatingRowColors(
-            True
-        )
+        self.group_splitter = QSplitter(Qt.Vertical)
+        self.group_splitter.addWidget(self.group_table)
+        hands_panel = QWidget()
+        hands_layout = QVBoxLayout(hands_panel)
+        hands_layout.setContentsMargins(0, 5, 0, 0)
+        self.group_hands_label = QLabel("Select a group to view its hands")
+        self.group_hands_label.setStyleSheet("color: #9fc5f8; font-weight: 700;")
+        self.group_hands_label.setWordWrap(True)
+        hands_layout.addWidget(self.group_hands_label)
 
-        self.pos_table.setEditTriggers(
-            QTableWidget.NoEditTriggers
-        )
-        lay.addWidget(
-            self.pos_table
-        )
-
-        self.tabs.addTab(
-            w,
-            "Position",
-        )
+        self.group_hand_table = QTableWidget(0, len(HAND_TABLE_HEADERS))
+        self.group_hand_table.setHorizontalHeaderLabels(HAND_TABLE_HEADERS)
+        self._configure_table_columns(self.group_hand_table)
+        hand_header = self.group_hand_table.horizontalHeader()
+        hand_header.setSortIndicator(0, Qt.DescendingOrder)
+        self.group_hand_table.setAlternatingRowColors(True)
+        self.group_hand_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.group_hand_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.group_hand_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        for column in (4, 5):
+            self.group_hand_table.setItemDelegateForColumn(
+                column, CardSuitDelegate(self.group_hand_table),
+            )
+        self.group_hand_table.cellDoubleClicked.connect(self.open_hand_replayer)
+        self.group_hand_table.setSortingEnabled(True)
+        hands_layout.addWidget(self.group_hand_table)
+        self.group_splitter.addWidget(hands_panel)
+        self.group_splitter.setSizes([310, 360])
+        lay.addWidget(self.group_splitter)
+        self.tabs.addTab(w, "Group By")
 
     def choose_file(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -2818,7 +2954,7 @@ class MainWindow(QMainWindow):
 
         self.refresh_hands(f)
         self.refresh_sessions(f)
-        self.refresh_positions(f)
+        self.refresh_group_by(f)
 
     def _sort_hands_by_column(
         self,
@@ -2837,6 +2973,8 @@ class MainWindow(QMainWindow):
             11,
             12,
             13,
+            14,
+            15,
         }
         if column == self._hand_sort_column:
             self._hand_sort_order = (
@@ -2883,6 +3021,13 @@ class MainWindow(QMainWindow):
             hand_no = str(
                 r["hand_id"]
             )
+        net_cents = float(r["hero_net_cents"] or 0)
+        allin_adj_cents = float(r["hero_allin_adj_cents"] or 0)
+        bb_cents = int(r["bb_cents"] or 0)
+        net_bb = net_cents / bb_cents if bb_cents else float("-inf")
+        allin_adj_bb = (
+            allin_adj_cents / bb_cents if bb_cents else float("-inf")
+        )
         return [
             r["started_at"],
             hand_no,
@@ -2927,10 +3072,8 @@ class MainWindow(QMainWindow):
                 if r["bb_cents"]
                 else float("-inf")
             ),
-            int(
-                r["hero_net_cents"]
-                or 0
-            ),
+            net_cents,
+            net_bb,
             (
                 float(
                     r["hero_allin_equity"]
@@ -2942,19 +3085,8 @@ class MainWindow(QMainWindow):
                 )
                 else -1.0
             ),
-            (
-                float(
-                    r["hero_allin_adj_cents"]
-                )
-                / int(
-                    r["bb_cents"]
-                )
-                if (
-                    r["hero_allin_adjusted"]
-                    and r["bb_cents"]
-                )
-                else float("-inf")
-            ),
+            allin_adj_cents,
+            allin_adj_bb,
         ]
 
     def _populate_hand_table(
@@ -2985,6 +3117,14 @@ class MainWindow(QMainWindow):
                 if r["bb_cents"]
                 else None
             )
+            hero_net_cents = float(r["hero_net_cents"] or 0)
+            hero_allin_adj_cents = float(r["hero_allin_adj_cents"] or 0)
+            bb_cents = int(r["bb_cents"] or 0)
+            hero_net_bb = hero_net_cents / bb_cents if bb_cents else None
+            hero_allin_adj_bb = (
+                hero_allin_adj_cents / bb_cents if bb_cents else None
+            )
+            allin_prefix = "~" if r["hero_allin_estimated"] else ""
             vals = [
                 r["started_at"][:19],
                 r["hand_id"],
@@ -3027,6 +3167,11 @@ class MainWindow(QMainWindow):
                     r["hero_net_cents"]
                 ),
                 (
+                    f"{hero_net_bb:.2f}"
+                    if hero_net_bb is not None
+                    else ""
+                ),
+                (
                     (
                         "~"
                         if r["hero_allin_estimated"]
@@ -3043,18 +3188,13 @@ class MainWindow(QMainWindow):
                     else ""
                 ),
                 (
-                    (
-                        "~"
-                        if r["hero_allin_estimated"]
-                        else ""
-                    )
-                    + (
-                        f"{float(r['hero_allin_adj_cents']) / r['bb_cents']:.2f}"
-                    )
-                    if (
-                        r["hero_allin_adjusted"]
-                        and r["bb_cents"]
-                    )
+                    allin_prefix
+                    + fmt_money(round(hero_allin_adj_cents))
+                ),
+                (
+                    allin_prefix
+                    + f"{hero_allin_adj_bb:.2f}"
+                    if hero_allin_adj_bb is not None
                     else ""
                 ),
             ]
@@ -3073,14 +3213,15 @@ class MainWindow(QMainWindow):
                     sort_values,
                 )
             ):
-                table.setItem(
-                    i,
-                    j,
-                    SortableTableWidgetItem(
-                        str(value),
-                        sort_value,
-                    ),
+                item = SortableTableWidgetItem(
+                    str(value),
+                    sort_value,
                 )
+                if j in {NET_WON_COLUMN, BB_WON_COLUMN}:
+                    self._apply_result_color(item, hero_net_cents)
+                elif j in {AI_ADJ_NET_WON_COLUMN, AI_ADJ_BB_COLUMN}:
+                    self._apply_result_color(item, hero_allin_adj_cents)
+                table.setItem(i, j, item)
 
     def refresh_hands(
         self,
@@ -3249,55 +3390,53 @@ class MainWindow(QMainWindow):
             f,
         )
 
-        self._session_rows = rows
-
-        self.session_table.blockSignals(
-            True
-        )
-        self.session_table.clearSelection()
-        self.session_table.setRowCount(
-            len(rows)
-        )
-        for i, r in enumerate(rows):
-            minutes = max(
-                0,
-                int(
-                    (
-                        r["end"]
-                        - r["start"]
-                    ).total_seconds()
-                    / 60
-                ),
-            )
-            vals = [
-                r["start"].strftime(
-                    "%Y-%m-%d %H:%M"
-                ),
-                r["end"].strftime(
-                    "%Y-%m-%d %H:%M"
-                ),
-                (
-                    f"{minutes // 60}h "
-                    f"{minutes % 60}m"
-                ),
-                str(
-                    r["hands"]
-                ),
-                fmt_money(
-                    r["net_cents"]
-                ),
-                f"{r['net_bb']:.1f}",
-            ]
-            for j, v in enumerate(vals):
-                self.session_table.setItem(
-                    i,
-                    j,
-                    QTableWidgetItem(v),
-                )
-        self.session_table.blockSignals(
-            False
-        )
+        table = self.session_table
+        was_blocked = table.blockSignals(True)
+        table.setUpdatesEnabled(False)
+        table.setSortingEnabled(False)
+        try:
+            self._session_rows = rows
+            table.clearSelection()
+            table.setRowCount(len(rows))
+            for i, r in enumerate(rows):
+                seconds = max(0, (r["end"] - r["start"]).total_seconds())
+                minutes = int(seconds / 60)
+                vals = [
+                    r["start"].strftime("%Y-%m-%d %H:%M"),
+                    r["end"].strftime("%Y-%m-%d %H:%M"),
+                    f"{minutes // 60}h {minutes % 60}m",
+                    str(r["hands"]),
+                    fmt_money(r["net_cents"]),
+                    f"{r['net_bb']:.1f}",
+                ]
+                sort_values = [
+                    r["start"], r["end"], seconds,
+                    r["hands"], r["net_cents"], r["net_bb"],
+                ]
+                for j, (value, sort_value) in enumerate(zip(vals, sort_values)):
+                    item = SortableTableWidgetItem(value, sort_value)
+                    if j in {4, 5}:
+                        self._apply_result_color(item, sort_value)
+                    if j == 0:
+                        # This index travels with the row when Qt sorts it.
+                        item.setData(Qt.UserRole, i)
+                    table.setItem(i, j, item)
+        finally:
+            # Reapply the chosen sort only after every cell is populated.
+            table.setSortingEnabled(True)
+            table.blockSignals(was_blocked)
+            table.setUpdatesEnabled(True)
         self.show_selected_session_hands()
+
+    def _sessions_for_rows(self, rows) -> list[dict]:
+        """Resolve visible rows to their sessions after sorting or header moves."""
+        sessions = []
+        for row in rows:
+            item = self.session_table.item(row, 0)
+            index = item.data(Qt.UserRole) if item is not None else None
+            if isinstance(index, int) and 0 <= index < len(self._session_rows):
+                sessions.append(self._session_rows[index])
+        return sessions
 
     def show_selected_session_hands(
         self,
@@ -3322,15 +3461,7 @@ class MainWindow(QMainWindow):
                 clicked_row
             )
             selected_rows.sort()
-        sessions = [
-            self._session_rows[row]
-            for row in selected_rows
-            if 0
-            <= row
-            < len(
-                self._session_rows
-            )
-        ]
+        sessions = self._sessions_for_rows(selected_rows)
         hand_ids = list(
             dict.fromkeys(
                 hand_id
@@ -3355,10 +3486,6 @@ class MainWindow(QMainWindow):
             )
             self.session_hand_table.setSortingEnabled(
                 True
-            )
-            self.session_hand_table.sortItems(
-                0,
-                Qt.DescendingOrder,
             )
         except Exception as exc:
             self.session_hand_table.setSortingEnabled(
@@ -3417,15 +3544,7 @@ class MainWindow(QMainWindow):
                 .selectedRows()
             }
         )
-        selected_sessions = [
-            self._session_rows[row]
-            for row in rows
-            if 0
-            <= row
-            < len(
-                self._session_rows
-            )
-        ]
+        selected_sessions = self._sessions_for_rows(rows)
 
         if not selected_sessions:
             QMessageBox.information(
@@ -3494,42 +3613,208 @@ class MainWindow(QMainWindow):
             10000,
         )
 
-    def refresh_positions(
-        self,
-        f,
-    ):
-        rows = self.db.positional(f)
-
-        self.pos_table.setRowCount(
-            len(rows)
+    def refresh_group_by(self, filters: dict | None = None):
+        group_by = self.group_by_combo.currentData()
+        if filters is None:
+            filters = self.filters.filters()
+        if self._selected_group_key is not None and self._selected_group_key[0] != group_by:
+            self._selected_group_key = None
+        self._group_filters = dict(filters)
+        self._group_rows, self._group_total = self.db.grouped_results(group_by, filters)
+        if group_by == "stakes":
+            for row in self._group_rows:
+                row["group"] = f"{fmt_money(row['sb_cents'])}/{fmt_money(row['bb_cents'])}"
+        self._group_total["group"] = (
+            "All stakes (filtered)" if group_by == "stakes" else "Total (filtered)"
         )
+        self._group_total["hand_type"] = ""
+        self.group_count_label.setText(
+            f"{self._group_total['hands']:,} hands · {len(self._group_rows):,} groups"
+        )
+        hint = (
+            "Current filters apply. Select a group to view its hands below. "
+            "Click a heading to sort; drag headings to reorder or edges to resize."
+        )
+        if group_by == "starting_hands":
+            hint += " AA = pair, AKs = suited, AKo = offsuit."
+        if not self._group_rows:
+            hint = "No hands match the current filters. " + hint
+        self.group_hint.setText(hint)
 
-        for i, r in enumerate(rows):
-            h = r["hands"] or 0
-            netbb = float(
-                r["net_bb"] or 0
-            )
-            vals = [
-                r["position"]
-                or "—",
-                str(h),
-                fmt_money(
-                    r["net_cents"]
-                    or 0
-                ),
-                (
-                    f"{(netbb * 100 / h if h else 0):.2f}"
-                ),
-                (
-                    f"{((r['vpip_n'] or 0) * 100 / h if h else 0):.1f}%"
-                ),
-                (
-                    f"{((r['pfr_n'] or 0) * 100 / h if h else 0):.1f}%"
-                ),
-            ]
-            for j, v in enumerate(vals):
-                self.pos_table.setItem(
-                    i,
-                    j,
-                    QTableWidgetItem(v),
+        columns = GROUP_BY_COLUMNS[group_by]
+        header = self.group_table.horizontalHeader()
+        columns_changed = self._group_column_mode != group_by
+        if columns_changed and self._group_column_mode is not None:
+            self._group_column_states[self._group_column_mode] = header.saveState()
+        was_blocked = self.group_table.blockSignals(True)
+        try:
+            self.group_table.clearContents()
+            self.group_table.setColumnCount(len(columns))
+            labels = {
+                "position": "Position", "stakes": "Stakes", "starting_hands": "Starting Hand",
+            }
+            self.group_table.setHorizontalHeaderLabels([
+                labels[group_by] if key == "group" else GROUP_COLUMN_DETAILS[key][0]
+                for key in columns
+            ])
+            for column, key in enumerate(columns):
+                tooltip = (
+                    "Sort by position, stake size, or starting-card ranks"
+                    if key == "group" else GROUP_COLUMN_DETAILS[key][2]
                 )
+                self.group_table.horizontalHeaderItem(column).setToolTip(tooltip)
+            if columns_changed:
+                # Each grouping has different columns. Restore its own layout
+                # before rendering so its saved sort choice takes precedence.
+                state = self._group_column_states.get(group_by)
+                layout_restored = state is not None and header.restoreState(state)
+                if not layout_restored:
+                    for column in range(len(columns)):
+                        header.moveSection(header.visualIndex(column), column)
+            self._render_group_rows()
+            if columns_changed:
+                if not layout_restored:
+                    self.group_table.resizeColumnsToContents()
+                self._group_column_mode = group_by
+        finally:
+            self.group_table.blockSignals(was_blocked)
+        self.show_selected_group_hands()
+
+    def _group_row_key(self, row: dict) -> tuple:
+        """Identify a group independently of its current sorted row number."""
+        group_by = self.group_by_combo.currentData()
+        if row is self._group_total:
+            return (group_by, None)
+        if group_by == "stakes":
+            return (group_by, (row["sb_cents"], row["bb_cents"]))
+        return (group_by, row["group"])
+
+    def show_selected_group_hands(self):
+        selected = self.group_table.selectionModel().selectedRows()
+        index = selected[0].row() if selected else -1
+        group = (
+            self._group_display_rows[index]
+            if 0 <= index < len(self._group_display_rows) else None
+        )
+        self._selected_group_key = self._group_row_key(group) if group is not None else None
+        table = self.group_hand_table
+        table.setUpdatesEnabled(False)
+        table.setSortingEnabled(False)
+        try:
+            rows = (
+                self.db.hands_for_group(*self._selected_group_key, filters=self._group_filters)
+                if self._selected_group_key is not None else []
+            )
+            self._populate_hand_table(table, rows)
+            if group is None:
+                self.group_hands_label.setText("Select a group to view its hands")
+            else:
+                label = "All filtered hands" if group is self._group_total else group["group"]
+                self.group_hands_label.setText(
+                    f"{label} · {len(rows):,} hand{'s' if len(rows) != 1 else ''}"
+                    " · Double-click a hand to open the replayer"
+                )
+        except Exception as exc:
+            table.setRowCount(0)
+            self.group_hands_label.setText("Could not load the selected group's hands")
+            QMessageBox.warning(
+                self, "Group hands",
+                f"The selected group's hands could not be loaded.\n\n{exc}",
+            )
+        finally:
+            # Re-enabling sorting reapplies the user's current column/order.
+            table.setSortingEnabled(True)
+            table.setUpdatesEnabled(True)
+        if table.rowCount():
+            table.selectRow(0)
+
+    def _sort_groups_by_column(self, column: int):
+        group_by = self.group_by_combo.currentData()
+        key = GROUP_BY_COLUMNS[group_by][column]
+        old_key, old_order = self._group_sorts[group_by]
+        if key == old_key:
+            order = Qt.AscendingOrder if old_order == Qt.DescendingOrder else Qt.DescendingOrder
+        elif key == "hand_type" or (key == "group" and group_by != "starting_hands"):
+            order = Qt.AscendingOrder
+        else:
+            order = Qt.DescendingOrder
+        self._group_sorts[group_by] = (key, order)
+        self._render_group_rows()
+
+    @staticmethod
+    def _group_sort_value(row: dict, key: str, group_by: str):
+        if key != "group":
+            value = row[key]
+            return value.casefold() if isinstance(value, str) else value
+        if group_by == "stakes":
+            return (row["bb_cents"], row["sb_cents"])
+        if group_by == "starting_hands":
+            return starting_hand_sort_key(row["group"])
+        positions = (
+            "EP1", "EP2", "EP3", "EP4", "EP5", "EP6", "UTG", "UTG+1", "UTG+2",
+            "MP", "HJ", "CO", "BTN", "BTN/SB", "SB", "BB",
+        )
+        position = row["group"]
+        return (positions.index(position) if position in positions else len(positions), position)
+
+    def _render_group_rows(self):
+        group_by = self.group_by_combo.currentData()
+        columns = GROUP_BY_COLUMNS[group_by]
+        key, order = self._group_sorts[group_by]
+        rows = sorted(
+            self._group_rows,
+            key=lambda row: self._group_sort_value(row, key, group_by),
+            reverse=order == Qt.DescendingOrder,
+        )
+        self._group_display_rows = [*rows, self._group_total]
+        was_blocked = self.group_table.blockSignals(True)
+        try:
+            self.group_table.horizontalHeader().setSortIndicator(columns.index(key), order)
+            self.group_table.setRowCount(0)
+            self.group_table.setRowCount(len(self._group_display_rows))
+            selected_row = None
+            for row_index, row in enumerate(self._group_display_rows):
+                if self._group_row_key(row) == self._selected_group_key:
+                    selected_row = row_index
+                self._populate_group_summary_row(row_index, row, columns)
+            if selected_row is not None:
+                self.group_table.selectRow(selected_row)
+            else:
+                self._selected_group_key = None
+        finally:
+            self.group_table.blockSignals(was_blocked)
+
+    def _populate_group_summary_row(self, row_index: int, row: dict, columns):
+        is_total = row is self._group_total
+        for column, column_key in enumerate(columns):
+            value = row[column_key]
+            kind = "text" if column_key == "group" else GROUP_COLUMN_DETAILS[column_key][1]
+            if kind == "money":
+                # Adjusted winnings may contain fractions of a cent.
+                text = fmt_money(round(value))
+            elif kind == "integer":
+                text = f"{value:,}"
+            elif kind == "percent":
+                text = fmt_pct(value)
+            elif kind == "number":
+                text = f"{value:.2f}"
+            else:
+                text = str(value)
+            item = QTableWidgetItem(text)
+            item.setTextAlignment(
+                (Qt.AlignLeft if kind == "text" else Qt.AlignRight) | Qt.AlignVCenter
+            )
+            if is_total:
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+                item.setBackground(QColor("#1b2a46"))
+                item.setToolTip(
+                    "Combined results for all hands matching the current filters. "
+                    "Rates use the combined hand and opportunity counts."
+                )
+            if column_key in {
+                "net_cents", "net_bb", "bb100", "allin_adj_cents", "allin_adj_bb100",
+            }:
+                self._apply_result_color(item, value)
+            self.group_table.setItem(row_index, column, item)

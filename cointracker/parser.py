@@ -538,7 +538,8 @@ def _position_map(seats: list[Seat], button_seat: int) -> dict[int, str]:
     elif n == 4:
         labels = ["BTN", "SB", "BB", "CO"]
     elif n == 5:
-        labels = ["BTN", "SB", "BB", "UTG", "CO"]
+        # Keep position names relative to the button as the table gets shorter.
+        labels = ["BTN", "SB", "BB", "HJ", "CO"]
     elif n >= 6:
         pre = ["BTN", "SB", "BB"]
         middle_count = n - 3
@@ -691,7 +692,9 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
                 raise_no = preflop_raise_count
                 pr.vpip = True
                 pr.pfr = True
-                if preflop_raise_count >= 2:
+                # The second raise is a 3-bet. Later raises are 4-bets+;
+                # an opener making one never had a 3-bet opportunity.
+                if preflop_raise_count == 2:
                     pr.three_bet = True
             add_action(player, "RAISE", increment, to_amt, aggressive=True, raise_no=raise_no, raw=s)
             continue
@@ -735,7 +738,7 @@ def parse_hand(text: str, hero_name: str = "Hero") -> Hand:
                     preflop_raise_count += 1
                     raise_no = preflop_raise_count
                     pr.pfr = True
-                    if preflop_raise_count >= 2:
+                    if preflop_raise_count == 2:
                         pr.three_bet = True
             add_action(player, "ALLIN", amount, after, aggressive=aggressive, raise_no=raise_no, raw=s)
             if not hand.first_allin_street:
