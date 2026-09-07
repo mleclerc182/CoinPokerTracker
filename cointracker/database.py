@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import asdict
+from heapq import nlargest
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from .parser import Hand, parse_hand
 from .equity import evaluator_available
+from .handtable import starting_hand_label, starting_hand_type
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -131,19 +134,39 @@ COIN_CASH_STAKES = (
 )
 
 CALCULATION_VERSION = "14-stable-rollback-v11-pot-layer-v1"
+THREE_BET_CALCULATION_VERSION = "2-second-preflop-raise-verified"
+POSITION_CALCULATION_VERSION = "2-five-handed-hj-verified"
 
 class TrackerDB:
-    def __init__(self, path: str | Path, migration_progress: Callable[[int, int], None] | None = None):
+    def __init__(self, path: str | Path, migration_progress: Callable[..., None] | None = None):
         self.path = str(path)
         self.migration_progress = migration_progress
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
+        self.conn.create_function(
+            "starting_hand_label", 1, starting_hand_label, deterministic=True,
+        )
         self.conn.executescript(SCHEMA)
+        self._report_migration_progress(
+            1, 5, "Database opened.\nChecking stored calculation fields…",
+        )
         self.recalculated_count = 0
         self.recalculation_errors = 0
         self._ensure_columns()
+        self._ensure_indexes()
         self._migrate_calculations_if_needed()
+        self._report_migration_progress(
+            2, 5, "Calculation fields checked.\nChecking 3-bet statistics…",
+        )
+        self._migrate_three_bet_flags_if_needed()
+        self._report_migration_progress(
+            3, 5, "3-bet statistics checked.\nChecking table positions…",
+        )
+        self._migrate_positions_if_needed()
+        self._report_migration_progress(
+            4, 5, "Database checks complete.\nLoading the tracker…",
+        )
     def _ensure_columns(self):
         """Add columns needed by newer builds without replacing the user's DB."""
         hands_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(hands)")}
@@ -173,6 +196,27 @@ class TrackerDB:
                 self.conn.execute(
                     "ALTER TABLE hands ADD COLUMN hero_allin_estimated INTEGER NOT NULL DEFAULT 0"
                 )
+
+    def _ensure_indexes(self):
+        """Add lookup indexes introduced after the original database schema."""
+        indexes = {
+            row[1]
+            for row in self.conn.execute("PRAGMA index_list(actions)")
+        }
+        if "idx_actions_three_bet" in indexes:
+            return
+        with self._database_update_progress(
+            0,
+            1,
+            "Optimizing the action history for regression checks…\n"
+            "This is a one-time database update.",
+        ), self.conn:
+            self.conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_actions_three_bet
+                   ON actions(
+                       street, raise_number, aggressive, action, hand_id, player
+                   )"""
+            )
     def _meta(self, key: str) -> str | None:
         row = self.conn.execute("SELECT value FROM tracker_meta WHERE key=?", (key,)).fetchone()
         return row[0] if row else None
@@ -183,6 +227,16 @@ class TrackerDB:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value),
         )
+
+    def _report_migration_progress(
+        self,
+        completed: int,
+        total: int,
+        message: str,
+    ):
+        if self.migration_progress:
+            self.migration_progress(completed, total, message)
+
     def _migrate_calculations_if_needed(self):
         if self._meta("calculation_version") == CALCULATION_VERSION:
             return
@@ -193,6 +247,253 @@ class TrackerDB:
         if self.recalculation_errors == 0:
             with self.conn:
                 self._set_meta("calculation_version", CALCULATION_VERSION)
+    def _migrate_three_bet_flags_if_needed(self):
+        """Repair old 4-bet+ flags using the stored, correctly numbered actions.
+
+        The old parser recorded every preflop raise after the opener as a
+        3-bet. Its action raise numbers and opportunity flags were already
+        correct, so this repair only needs to rebuild the 3-bet flags. A
+        separate version avoids rerunning costly all-in equity calculations.
+        """
+        marker_is_current = (
+            self._meta("three_bet_calculation_version")
+            == THREE_BET_CALCULATION_VERSION
+        )
+        needs_repair = self._three_bet_flags_need_repair()
+        if marker_is_current and not needs_repair:
+            return
+        if not needs_repair:
+            with self.conn:
+                self._set_meta(
+                    "three_bet_calculation_version",
+                    THREE_BET_CALCULATION_VERSION,
+                )
+            return
+        three_bettors = """SELECT hand_id, player FROM actions
+            WHERE street = 'PREFLOP' AND raise_number = 2
+              AND aggressive = 1 AND action IN ('RAISE', 'ALLIN')"""
+        with self._database_update_progress(
+            0, 2, "Repairing Database statistics…\nUpdating hand summaries (step 1 of 2).",
+        ) as report_progress, self.conn:
+            self.conn.execute(
+                f"""UPDATE hands SET hero_three_bet =
+                    (hand_id, hero_name) IN ({three_bettors})"""
+            )
+            report_progress(
+                1,
+                "Repairing Database statistics…\nUpdating player results (step 2 of 2).",
+            )
+            self.conn.execute(
+                f"""UPDATE player_results SET three_bet =
+                    (hand_id, player) IN ({three_bettors})"""
+            )
+            self._set_meta("three_bet_calculation_version", THREE_BET_CALCULATION_VERSION)
+
+    def _three_bet_flags_need_repair(self) -> bool:
+        """Check stored flags even if an earlier build wrote a migration marker."""
+        queries = (
+            (
+                "hand summaries already marked as 3-bets",
+                """SELECT 1 FROM hands AS stored
+                WHERE stored.hero_three_bet NOT IN (0, 1)
+                   OR (
+                    stored.hero_three_bet = 1 AND NOT EXISTS (
+                    SELECT 1 FROM actions AS action INDEXED BY idx_actions_three_bet
+                    WHERE action.hand_id = stored.hand_id
+                      AND action.player = stored.hero_name
+                      AND action.street = 'PREFLOP'
+                      AND action.raise_number = 2
+                      AND action.aggressive = 1
+                      AND action.action IN ('RAISE', 'ALLIN')
+                    )
+                ) LIMIT 1""",
+            ),
+            (
+                "3-bet actions missing from hand summaries",
+                """SELECT 1 FROM actions AS action INDEXED BY idx_actions_three_bet
+                JOIN hands AS stored
+                  ON stored.hand_id = action.hand_id
+                 AND stored.hero_name = action.player
+                WHERE action.street = 'PREFLOP'
+                  AND action.raise_number = 2
+                  AND action.aggressive = 1
+                  AND action.action IN ('RAISE', 'ALLIN')
+                  AND stored.hero_three_bet != 1
+                LIMIT 1""",
+            ),
+            (
+                "player results already marked as 3-bets",
+                """SELECT 1 FROM player_results AS stored
+                WHERE stored.three_bet NOT IN (0, 1)
+                   OR (
+                    stored.three_bet = 1 AND NOT EXISTS (
+                    SELECT 1 FROM actions AS action INDEXED BY idx_actions_three_bet
+                    WHERE action.hand_id = stored.hand_id
+                      AND action.player = stored.player
+                      AND action.street = 'PREFLOP'
+                      AND action.raise_number = 2
+                      AND action.aggressive = 1
+                      AND action.action IN ('RAISE', 'ALLIN')
+                    )
+                ) LIMIT 1""",
+            ),
+            (
+                "3-bet actions missing from player results",
+                """SELECT 1 FROM actions AS action INDEXED BY idx_actions_three_bet
+                JOIN player_results AS stored
+                  ON stored.hand_id = action.hand_id
+                 AND stored.player = action.player
+                WHERE action.street = 'PREFLOP'
+                  AND action.raise_number = 2
+                  AND action.aggressive = 1
+                  AND action.action IN ('RAISE', 'ALLIN')
+                  AND stored.three_bet != 1
+                LIMIT 1""",
+            ),
+        )
+        with self._database_update_progress(
+            0,
+            len(queries),
+            "Checking Database statistics…\nStarting regression check 1 of 4.",
+            finish=False,
+        ) as report_progress:
+            for index, (description, query) in enumerate(queries, 1):
+                report_progress(
+                    index - 1,
+                    "Checking Database statistics…\n"
+                    f"Checking {description} ({index} of {len(queries)}).",
+                )
+                if self.conn.execute(query).fetchone():
+                    return True
+                report_progress(
+                    index,
+                    "Checking Datanase statistics…\n"
+                    f"Completed regression check {index} of {len(queries)}.",
+                )
+        return False
+
+    def _migrate_positions_if_needed(self):
+        """Move the old five-handed UTG labels to HJ in every stored table.
+
+        Count the seats recorded for each hand, not the table's maximum
+        capacity. Six-handed UTG remains UTG, and no equity recalculation or
+        hand-history re-import is required.
+        """
+        marker_is_current = (
+            self._meta("position_calculation_version")
+            == POSITION_CALCULATION_VERSION
+        )
+        needs_repair = self._positions_need_repair()
+        if marker_is_current and not needs_repair:
+            return
+        if not needs_repair:
+            with self.conn:
+                self._set_meta(
+                    "position_calculation_version",
+                    POSITION_CALCULATION_VERSION,
+                )
+            return
+        five_handed = """SELECT hand_id FROM seats
+            GROUP BY hand_id HAVING COUNT(*) = 5"""
+        with self._database_update_progress(
+            0, 3, "Repairing five-handed positions…\nUpdating hands (step 1 of 3).",
+        ) as report_progress, self.conn:
+            tables = (
+                ("hands", "hero_position"),
+                ("seats", "position"),
+                ("player_results", "position"),
+            )
+            for index, (table, column) in enumerate(tables, 1):
+                self.conn.execute(
+                    f"""UPDATE {table} SET {column} = 'HJ'
+                        WHERE {column} = 'UTG' AND hand_id IN ({five_handed})"""
+                )
+                if index < len(tables):
+                    next_table = "seats" if index == 1 else "player results"
+                    report_progress(
+                        index,
+                        "Repairing five-handed positions…\n"
+                        f"Updating {next_table} (step {index + 1} of 3).",
+                    )
+            self._set_meta("position_calculation_version", POSITION_CALCULATION_VERSION)
+
+    def _positions_need_repair(self) -> bool:
+        """Find legacy five-handed UTG labels regardless of migration metadata."""
+        tables = (
+            ("hands", "hero_position"),
+            ("seats", "position"),
+            ("player_results", "position"),
+        )
+        with self._database_update_progress(
+            0,
+            len(tables),
+            "Checking five-handed positions…\nStarting regression check 1 of 3.",
+            finish=False,
+        ) as report_progress:
+            for index, (table, column) in enumerate(tables, 1):
+                report_progress(
+                    index - 1,
+                    "Checking five-handed positions…\n"
+                    f"Checking {table} (step {index} of {len(tables)}).",
+                )
+                row = self.conn.execute(
+                    f"""SELECT 1 FROM {table} AS stored
+                        WHERE stored.{column} = 'UTG'
+                          AND 5 = (
+                              SELECT COUNT(*) FROM seats
+                              WHERE seats.hand_id = stored.hand_id
+                          )
+                        LIMIT 1"""
+                ).fetchone()
+                if row:
+                    return True
+                report_progress(
+                    index,
+                    "Checking five-handed positions…\n"
+                    f"Completed regression check {index} of {len(tables)}.",
+                )
+        return False
+
+    @contextmanager
+    def _database_update_progress(
+        self,
+        completed: int,
+        total: int,
+        message: str,
+        finish: bool = True,
+    ):
+        """Pump startup progress during SQL repairs and clean up on failure."""
+        notify = self.migration_progress
+        if not self.conn.execute("SELECT 1 FROM hands LIMIT 1").fetchone():
+            notify = None
+        state = {
+            "completed": completed,
+            "message": message,
+        }
+
+        def pump_events():
+            notify(state["completed"], total, state["message"])
+            return 0  # Continue SQLite execution; this is not a cancel action.
+
+        def report_progress(new_completed: int, new_message: str):
+            state["completed"] = new_completed
+            state["message"] = new_message
+            if notify:
+                notify(new_completed, total, new_message)
+
+        if notify:
+            pump_events()
+            # SQLite calls this during long statements, allowing the startup
+            # window to repaint while the updates and commit are in progress.
+            self.conn.set_progress_handler(pump_events, 10_000)
+        try:
+            yield report_progress
+        finally:
+            if notify:
+                self.conn.set_progress_handler(None, 0)
+        if notify and finish:
+            notify(total, total, state["message"])
+
     def recalculate_all_hands(self) -> int:
         """Reparse stored raw HH so formula fixes apply to already-imported hands."""
         rows = self.conn.execute(
@@ -202,8 +503,11 @@ class TrackerDB:
             return 0
 
         total_rows = len(rows)
-        if self.migration_progress:
-            self.migration_progress(0, total_rows)
+        self._report_migration_progress(
+            0,
+            total_rows,
+            f"Recalculating stored hands…\nProcessed 0 of {total_rows:,}.",
+        )
         hand_updates = []
         result_updates = []
         self.recalculation_errors = 0
@@ -229,8 +533,16 @@ class TrackerDB:
                 int(p.three_bet), int(p.three_bet_opp), int(p.saw_flop),
                 int(p.went_to_showdown), int(p.won_showdown), hand.hand_id, p.player,
             ) for p in hand.player_results.values())
-            if self.migration_progress and (index == total_rows or index % 100 == 0):
-                self.migration_progress(index, total_rows)
+            # The UI throttles repaints, so report each completed hand. This
+            # keeps progress alive even when a batch of 100 expensive equity
+            # calculations would otherwise make startup look frozen.
+            if self.migration_progress:
+                self._report_migration_progress(
+                    index,
+                    total_rows,
+                    "Recalculating stored hands…\n"
+                    f"Processed {index:,} of {total_rows:,}.",
+                )
         with self.conn:
             self.conn.executemany(
                 """UPDATE hands SET
@@ -346,6 +658,9 @@ class TrackerDB:
         if filters.get("bb_cents") is not None:
             clauses.append("bb_cents = ?")
             params.append(filters["bb_cents"])
+        if filters.get("sb_cents") is not None:
+            clauses.append("sb_cents = ?")
+            params.append(filters["sb_cents"])
         if filters.get("splash") == "only":
             clauses.append("splash_cents > 0")
         elif filters.get("splash") == "exclude":
@@ -487,21 +802,94 @@ class TrackerDB:
         return [(r[0], r[1]) for r in self.conn.execute(
             "SELECT DISTINCT sb_cents, bb_cents FROM hands ORDER BY bb_cents, sb_cents"
         ).fetchall()]
-    def hands(self, filters: dict | None = None, limit: int = 2000) -> list[sqlite3.Row]:
+    def hand_count(self, filters: dict | None = None) -> int:
+        """Count all matching hands independently of the display limit."""
         where, params = self._where(filters)
-        params = list(params) + [limit]
+        return self.conn.execute(
+            f"SELECT COUNT(*) FROM hands{where}", params,
+        ).fetchone()[0]
+
+    def hands(self, filters: dict | None = None, limit: int = 1000) -> list[sqlite3.Row]:
+        """Return the latest matching hands; a negative limit returns all."""
+        where, params = self._where(filters)
+        return self._query_hands(where, params, limit)
+
+    def _query_hands(self, where: str, params: Iterable, limit: int) -> list[sqlite3.Row]:
+        """Fetch the shared hand-table columns after applying a SQL condition."""
         return self.conn.execute(
             f"""SELECT hand_id, started_at, sb_cents, bb_cents, hero_position, hero_cards,
                 board1, board2, board3, run_count, splash_type, splash_cents,
                 total_pot_cents, rake_cents, hero_contributed_cents,
                 hero_returned_cents, hero_splash_won_cents, hero_net_cents,
                 hero_allin_adj_cents, hero_allin_equity, hero_allin_adjusted, hero_allin_estimated
-                FROM hands{where} ORDER BY started_at DESC, hand_id DESC LIMIT ?""", params
+                FROM hands{where} ORDER BY started_at DESC, hand_id DESC LIMIT ?""",
+            [*params, limit],
         ).fetchall()
 
-    def hands_by_ids(self, hand_ids: Iterable[str]) -> list[sqlite3.Row]:
-        """Return full Hands-tab rows for an explicit set of stored hand IDs."""
+    def hands_for_group(
+        self,
+        group_by: str,
+        group_key: str | tuple[int, int] | None,
+        filters: dict | None = None,
+        limit: int = -1,
+    ) -> list[sqlite3.Row]:
+        """Return the latest filtered hands in a group; None selects the total.
+
+        Use the same position normalization and starting-hand categories as
+        grouped_results. Add the group condition to the active filters rather
+        than replacing a potentially narrower existing filter. A negative
+        limit returns all matching hands.
+        """
+        if group_by not in {"position", "stakes", "starting_hands"}:
+            raise ValueError(f"Unsupported grouping: {group_by}")
+        if group_key is None:
+            return self.hands(filters, limit=limit)
+
+        where, params = self._where(filters)
+        if group_by == "stakes":
+            if not isinstance(group_key, (tuple, list)) or len(group_key) != 2:
+                raise ValueError("A stakes group requires its small and big blind")
+            condition = "sb_cents = ? AND bb_cents = ?"
+            params.extend(group_key)
+        elif group_by == "starting_hands":
+            condition = "starting_hand_label(hero_cards) = ?"
+            params.append(group_key)
+        else:
+            condition = "COALESCE(NULLIF(TRIM(hero_position), ''), 'Unknown') = ?"
+            params.append(group_key)
+        where += (" AND " if where else " WHERE ") + condition
+        return self._query_hands(where, params, limit)
+
+    def hands_by_ids(
+        self, hand_ids: Iterable[str], limit: int = -1,
+    ) -> list[sqlite3.Row]:
+        """Return the latest stored hands in an ID set; a negative limit returns all.
+
+        Select by date across the entire set before loading full hand rows.
+        This keeps a large session selection from loading every hand when the
+        user only wants to display its most recent 1,000.
+        """
+        if limit == 0:
+            return []
         ids = list(dict.fromkeys(str(hand_id) for hand_id in hand_ids if hand_id))
+        if limit > 0 and len(ids) > limit:
+            def candidates():
+                for index in range(0, len(ids), 800):
+                    chunk = ids[index:index + 800]
+                    marks = ",".join("?" for _ in chunk)
+                    yield from self.conn.execute(
+                        f"""SELECT hand_id, started_at FROM hands
+                            WHERE hand_id IN ({marks})
+                            ORDER BY started_at DESC, hand_id DESC LIMIT ?""",
+                        [*chunk, limit],
+                    )
+
+            ids = [
+                row["hand_id"] for row in nlargest(
+                    limit, candidates(),
+                    key=lambda row: (row["started_at"], row["hand_id"]),
+                )
+            ]
         if not ids:
             return []
 
@@ -510,17 +898,7 @@ class TrackerDB:
             chunk = ids[index:index + 800]
             marks = ",".join("?" for _ in chunk)
             rows.extend(
-                self.conn.execute(
-                    f"""SELECT hand_id, started_at, sb_cents, bb_cents,
-                        hero_position, hero_cards, board1, board2, board3,
-                        run_count, splash_type, splash_cents, total_pot_cents,
-                        rake_cents, hero_contributed_cents, hero_returned_cents,
-                        hero_splash_won_cents, hero_net_cents,
-                        hero_allin_adj_cents, hero_allin_equity,
-                        hero_allin_adjusted, hero_allin_estimated
-                        FROM hands WHERE hand_id IN ({marks})""",
-                    chunk,
-                ).fetchall()
+                self._query_hands(f" WHERE hand_id IN ({marks})", chunk, -1)
             )
         return sorted(
             rows,
@@ -597,3 +975,88 @@ class TrackerDB:
               FROM hands{where}
               GROUP BY hero_position ORDER BY hands DESC""", params
         ).fetchall()
+
+    def grouped_results(
+        self, group_by: str = "position", filters: dict | None = None,
+    ) -> tuple[list[dict], dict]:
+        """Return grouped results and a total for exactly the filtered hands.
+
+        Aggregate raw counts before calculating percentages. In particular,
+        mixed-stakes BB results sum each hand's winnings divided by its own
+        big blind; totals never average the displayed group percentages.
+        """
+        group_columns = {
+            "position": "COALESCE(NULLIF(TRIM(hero_position), ''), 'Unknown')",
+            "stakes": "sb_cents, bb_cents",
+            "starting_hands": "hero_cards",
+        }
+        if group_by not in group_columns:
+            raise ValueError(f"Unsupported grouping: {group_by}")
+        aggregates = {
+            "hands": "COUNT(*)",
+            "net_cents": "SUM(hero_net_cents)",
+            "allin_adj_cents": "SUM(hero_allin_adj_cents)",
+            "splash_won_cents": "SUM(hero_splash_won_cents)",
+            "net_bb": "SUM(CASE WHEN bb_cents > 0 THEN CAST(hero_net_cents AS REAL) / bb_cents ELSE 0 END)",
+            "allin_adj_bb": "SUM(CASE WHEN bb_cents > 0 THEN CAST(hero_allin_adj_cents AS REAL) / bb_cents ELSE 0 END)",
+            "vpip_n": "SUM(hero_vpip)",
+            "pfr_n": "SUM(hero_pfr)",
+            "three_bet_n": "SUM(hero_three_bet)",
+            "three_bet_opp_n": "SUM(hero_three_bet_opp)",
+            "saw_flop_n": "SUM(hero_saw_flop)",
+            "wwsf_wins": "SUM(CASE WHEN hero_saw_flop = 1 AND (hero_collected_cents > 0 OR hero_splash_won_cents > 0) THEN 1 ELSE 0 END)",
+            "wtsd_n": "SUM(hero_wtsd)",
+            "won_sd_n": "SUM(hero_won_sd)",
+        }
+        group_sql = group_columns[group_by]
+        selection = group_sql if group_by == "stakes" else f"{group_sql} AS group_value"
+        metrics_sql = ", ".join(
+            f"COALESCE({expression}, 0) AS {key}"
+            for key, expression in aggregates.items()
+        )
+        where, params = self._where(filters)
+        rows = self.conn.execute(
+            f"SELECT {selection}, {metrics_sql} FROM hands{where} "
+            f"GROUP BY {group_sql} ORDER BY {group_sql}", params,
+        )
+        groups = {}
+        total = {key: 0 for key in aggregates}
+        for row in rows:
+            if group_by == "stakes":
+                key = (row["sb_cents"], row["bb_cents"])
+                identity = {"sb_cents": key[0], "bb_cents": key[1]}
+            elif group_by == "starting_hands":
+                key = starting_hand_label(row["group_value"])
+                identity = {"group": key, "hand_type": starting_hand_type(key)}
+            else:
+                key = row["group_value"]
+                identity = {"group": key}
+            if key not in groups:
+                groups[key] = {**identity, **{name: 0 for name in aggregates}}
+            for name in aggregates:
+                groups[key][name] += row[name]
+                total[name] += row[name]
+
+        def add_rates(result: dict):
+            for name, numerator, denominator in (
+                ("bb100", "net_bb", "hands"),
+                ("allin_adj_bb100", "allin_adj_bb", "hands"),
+                ("vpip", "vpip_n", "hands"),
+                ("pfr", "pfr_n", "hands"),
+                ("three_bet", "three_bet_n", "three_bet_opp_n"),
+                ("wwsf", "wwsf_wins", "saw_flop_n"),
+                ("wtsd", "wtsd_n", "saw_flop_n"),
+                ("wsd", "won_sd_n", "wtsd_n"),
+            ):
+                result[name] = (
+                    result[numerator] * 100 / result[denominator]
+                    if result[denominator] else 0.0
+                )
+            result["share_pct"] = (
+                result["hands"] * 100 / total["hands"] if total["hands"] else 0.0
+            )
+
+        for result in groups.values():
+            add_rates(result)
+        add_rates(total)
+        return list(groups.values()), total

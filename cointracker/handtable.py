@@ -105,3 +105,51 @@ def hole_card_sort_key(text: str) -> tuple:
     suited = int(cards[0][1] == cards[1][1])
     canonical = normalize_hole_cards(text).casefold()
     return (ranks[0], ranks[1], suited, canonical)
+
+
+def starting_hand_label(text: str | None) -> str:
+    """Group two-card holdings as AA, AKs or AKo, regardless of deal order.
+
+    Preserve every card in other variants instead of treating the first two
+    cards of an Omaha hand as a Hold'em starting hand.
+    """
+    tokens = (text or "").split()
+    if not tokens:
+        return "Unknown"
+    matches = [_CARD_RE.fullmatch(token) for token in tokens]
+    if not all(matches):
+        return " ".join(tokens)
+    cards = [(m.group(1).upper(), m.group(2).lower()) for m in matches]
+    cards.sort(key=lambda card: (RANK_VALUES[card[0]], card[1]), reverse=True)
+    if len(cards) != 2 or cards[0] == cards[1]:
+        return " ".join(rank + suit for rank, suit in cards)
+    (high, first_suit), (low, second_suit) = cards
+    if high == low:
+        return high + low
+    return high + low + ("s" if first_suit == second_suit else "o")
+
+
+def starting_hand_type(label: str) -> str:
+    if label == "Unknown":
+        return "Unknown"
+    if re.fullmatch(r"([2-9TJQKA])\1", label):
+        return "Pair"
+    if re.fullmatch(r"[2-9TJQKA]{2}[so]", label):
+        return "Suited" if label.endswith("s") else "Offsuit"
+    return "Other"
+
+
+def starting_hand_sort_key(label: str) -> tuple:
+    """Sort by poker ranks, with suited before offsuit in descending order."""
+    match = re.fullmatch(r"([2-9TJQKA])([2-9TJQKA])([so]?)", label)
+    if match:
+        return (
+            (RANK_VALUES[match[1]], RANK_VALUES[match[2]]),
+            int(match[3] == "s"),
+            label,
+        )
+    ranks = tuple(sorted(
+        (RANK_VALUES[m[1].upper()] for m in _CARD_RE.finditer(label)),
+        reverse=True,
+    ))
+    return (ranks or (-1,), -1, label)

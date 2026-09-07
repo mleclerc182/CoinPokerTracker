@@ -2,7 +2,7 @@
 ; Built with Inno Setup
 
 #define MyAppName "CoinPoker Tracker"
-#define MyAppVersion "1.0.6"
+#define MyAppVersion "1.0.7"
 #define MyAppPublisher "mleclerc182"
 #define MyAppExeName "CoinPokerTracker.exe"
 
