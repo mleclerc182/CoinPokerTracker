@@ -4,7 +4,7 @@ import json
 import os
 import re
 from pathlib import Path
-from PySide6.QtCore import QDate, QItemSelectionModel, QLocale, QPoint, QSettings, Qt, Signal, QThread
+from PySide6.QtCore import QDate, QItemSelectionModel, QLocale, QPoint, QSettings, Qt, Signal, Slot, QThread
 from PySide6.QtGui import QAction, QColor, QDoubleValidator, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCalendarWidget, QCheckBox, QComboBox, QDialog,
@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 )
 from .database import TrackerDB
 from .equity import evaluator_available
+from .exporter import ExportCancelled, export_hands
 from .importer import import_file, import_folder
 from .graphing import hand_tick_step, hand_ticks, money_axis_bounds, nice_step
 from .handtable import (
@@ -887,6 +888,86 @@ class ImportWorker(QThread):
             db.close()
 
 
+class ExportWorker(QThread):
+    progress_changed = Signal(int, int)
+
+    def __init__(self, db_path, target, *, filters=None, hand_ids=None, parent=None):
+        super().__init__(parent)
+        self.db_path = db_path
+        self.target = target
+        self.filters = dict(filters) if filters is not None else None
+        self.hand_ids = tuple(hand_ids) if hand_ids is not None else None
+        self.exported_count = 0
+        self.error = ""
+        self.cancelled = False
+
+    def run(self):
+        try:
+            self.exported_count = export_hands(
+                self.db_path,
+                self.target,
+                filters=self.filters,
+                hand_ids=self.hand_ids,
+                progress=self.progress_changed.emit,
+                is_cancelled=self.isInterruptionRequested,
+            )
+        except ExportCancelled:
+            self.cancelled = True
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"
+
+
+class ExportProgressDialog(QDialog):
+    cancel_requested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Export hands")
+        self.setWindowModality(Qt.WindowModal)
+        self.setMinimumWidth(420)
+        self.cancelling = False
+
+        layout = QVBoxLayout(self)
+
+        self.label = QLabel("Preparing hand histories…")
+        self.label.setWordWrap(True)
+        layout.addWidget(self.label)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        layout.addWidget(self.progress)
+
+        controls = QHBoxLayout()
+        controls.addStretch(1)
+
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.reject)
+        controls.addWidget(self.cancel_button)
+
+        layout.addLayout(controls)
+
+    def reject(self):
+        # Keep the dialog alive until the worker closes its file and connection.
+        if not self.cancelling:
+            self.cancelling = True
+            self.cancel_button.setEnabled(False)
+            self.label.setText("Cancelling export…")
+            self.cancel_requested.emit()
+
+    @Slot(int, int)
+    def update_progress(self, current, total):
+        if self.cancelling:
+            return
+
+        self.progress.setRange(0, max(1, total))
+        self.progress.setValue(current)
+        self.label.setText(
+            "Finishing export…"
+            if total and current == total
+            else f"Exporting hands: {current:,} / {total:,}"
+        )
+
+
 class ClickableDateField(QLineEdit):
     """Read-only date display that opens its calendar when clicked."""
 
@@ -1523,6 +1604,9 @@ class MainWindow(QMainWindow):
         )
 
         self.worker = None
+        self.export_worker = None
+        self.export_dialog = None
+        self._close_after_export = False
 
         self.setWindowTitle(
             "CoinPoker Tracker v1.0.6"
@@ -1569,9 +1653,9 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
         self._build_overview()
-        self._build_hands()
-        self._build_sessions()
         self._build_group_by()
+        self._build_sessions()
+        self._build_hands()
         self._build_menu()
 
         self.refresh_all()
@@ -1775,8 +1859,62 @@ class MainWindow(QMainWindow):
         self,
         event,
     ):
+        if self.export_worker is not None:
+            self._close_after_export = True
+            if self.export_dialog is not None:
+                self.export_dialog.reject()
+            event.ignore()
+            return
+
+        self._save_table_layouts()
         self.db.close()
         super().closeEvent(event)
+
+    def _restore_table_header(self, table: QTableWidget, setting_name: str) -> bool:
+        """Restore a table header's saved column order and widths."""
+        state = self.settings.value(
+            f"table_layouts/{setting_name}"
+        )
+        if state is None:
+            return False
+        return bool(
+            table.horizontalHeader().restoreState(state)
+        )
+
+    def _save_table_layouts(self):
+        """Persist user-adjusted table column layouts across app launches."""
+        tables = (
+            ("hands", getattr(self, "hand_table", None)),
+            ("sessions", getattr(self, "session_table", None)),
+            ("session_hands", getattr(self, "session_hand_table", None)),
+            ("group_hands", getattr(self, "group_hand_table", None)),
+        )
+        for setting_name, table in tables:
+            if table is not None:
+                self.settings.setValue(
+                    f"table_layouts/{setting_name}",
+                    table.horizontalHeader().saveState(),
+                )
+
+        # Group By has a different column set for each mode. Save the current
+        # mode first, then persist every mode cached while the app was open.
+        group_table = getattr(self, "group_table", None)
+        group_by_combo = getattr(self, "group_by_combo", None)
+        if group_table is not None and group_by_combo is not None:
+            current_mode = group_by_combo.currentData()
+            if current_mode:
+                self._group_column_states[current_mode] = (
+                    group_table.horizontalHeader().saveState()
+                )
+
+            for mode, state in self._group_column_states.items():
+                if state is not None:
+                    self.settings.setValue(
+                        f"table_layouts/group_by/{mode}",
+                        state,
+                    )
+
+        self.settings.sync()
 
     def _build_menu(self):
         file_menu = self.menuBar().addMenu(
@@ -1805,6 +1943,41 @@ class MainWindow(QMainWindow):
 
         import_menu.addAction(a_file)
         import_menu.addAction(a_folder)
+
+        file_menu.addSeparator()
+
+        export_menu = file_menu.addMenu(
+            "Export"
+        )
+
+        export_all = QAction(
+            "Export all hands…",
+            self,
+        )
+        export_all.setToolTip(
+            "Export every stored hand as an original hand history"
+        )
+        export_all.triggered.connect(
+            self.export_all_hands
+        )
+        export_menu.addAction(
+            export_all
+        )
+
+        export_filtered = QAction(
+            "Export current filtered hands…",
+            self,
+        )
+        export_filtered.setToolTip(
+            "Export every hand matching the current filters, "
+            "regardless of table display limits"
+        )
+        export_filtered.triggered.connect(
+            self.export_filtered_hands
+        )
+        export_menu.addAction(
+            export_filtered
+        )
 
         file_menu.addSeparator()
 
@@ -2003,11 +2176,27 @@ class MainWindow(QMainWindow):
 
         graph_controls.addStretch(1)
 
+        self.graph_popout_button = QPushButton("Pop out graph")
+        self.graph_popout_button.setToolTip(
+            "Open the profit graph in a large window with normal window controls."
+        )
+        self.graph_popout_button.clicked.connect(
+            self.show_graph_popout
+        )
+        graph_controls.addWidget(
+            self.graph_popout_button
+        )
+
         outer.addLayout(
             graph_controls
         )
 
         self.graph = ProfitGraph()
+        self.graph_popout = None
+        self.graph_popout_graph = None
+        self.graph_popout_stats = {}
+        self.graph_popout_filter_label = None
+        self.graph_popout_stats_panel = None
 
         for key, checkbox in self.graph_checks.items():
             self.graph.set_series_visible(
@@ -2255,6 +2444,201 @@ class MainWindow(QMainWindow):
                 checked,
             )
 
+        if (
+            getattr(self, "graph_popout_graph", None) is not None
+        ):
+            self.graph_popout_graph.set_series_visible(
+                key,
+                checked,
+            )
+
+    def _refresh_graph_popout_stats(self):
+        stats = getattr(
+            self,
+            "graph_popout_stats",
+            {},
+        )
+        if not stats:
+            return
+
+        card_map = {
+            "Total Hands": "Hands",
+            "Net Won": "Net Won",
+            "All-in Adj Net Won": "All-in Adj Net Won",
+            "bb/100": "bb/100",
+            "All-in Adj bb/100": "Adj bb/100",
+        }
+        for label, card_title in card_map.items():
+            value_label = stats.get(label)
+            card = self.cards.get(card_title)
+            if value_label is not None and card is not None:
+                value_label.setText(card.value.text())
+
+        filter_label = getattr(
+            self,
+            "graph_popout_filter_label",
+            None,
+        )
+        if filter_label is not None:
+            summary = self.filters.summary()
+            filter_label.setText(
+                "None — All hands"
+                if summary == "All hands"
+                else summary
+            )
+
+        stats_panel = getattr(
+            self,
+            "graph_popout_stats_panel",
+            None,
+        )
+        if stats_panel is not None:
+            stats_panel.adjustSize()
+            stats_panel.raise_()
+
+    def show_graph_popout(self):
+        if self.graph_popout is not None:
+            self._refresh_graph_popout_stats()
+            if self.graph_popout.windowState() & Qt.WindowMinimized:
+                self.graph_popout.showNormal()
+            else:
+                self.graph_popout.show()
+            self.graph_popout.raise_()
+            self.graph_popout.activateWindow()
+            return
+
+        dialog = QDialog(self, Qt.Window)
+        dialog.setWindowTitle("CoinPoker Tracker — Profit Graph")
+        dialog.setWindowFlags(
+            Qt.Window
+            | Qt.WindowTitleHint
+            | Qt.WindowSystemMenuHint
+            | Qt.WindowMinMaxButtonsHint
+            | Qt.WindowCloseButtonHint
+        )
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+
+        # Open the pop-out at about 82% of the available screen. This same
+        # geometry is also the restore target after maximizing, so dragging a
+        # maximized title bar returns to a large, useful window instead of a
+        # thin rectangle. Keep a floor as well so manual resizing cannot
+        # collapse it.
+        available = self.screen().availableGeometry()
+        normal_width = max(1000, int(available.width() * 0.82))
+        normal_height = max(650, int(available.height() * 0.82))
+        normal_width = min(normal_width, available.width())
+        normal_height = min(normal_height, available.height())
+        dialog.setMinimumSize(900, 600)
+        dialog.resize(normal_width, normal_height)
+        dialog.move(
+            available.x() + (available.width() - normal_width) // 2,
+            available.y() + (available.height() - normal_height) // 2,
+        )
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(0)
+
+        stats_panel = QFrame()
+        stats_panel.setObjectName("graphPopoutStats")
+        stats_panel.setFixedWidth(285)
+        stats_panel.setStyleSheet(
+            """
+            QFrame#graphPopoutStats {
+                background-color: #111c30;
+                border: 1px solid #263552;
+                border-radius: 9px;
+            }
+            QLabel {
+                background: transparent;
+                border: none;
+            }
+            """
+        )
+        stats_layout = QVBoxLayout(stats_panel)
+        stats_layout.setContentsMargins(14, 12, 14, 12)
+        stats_layout.setSpacing(6)
+
+        title = QLabel("Current Results")
+        title.setStyleSheet(
+            "color: #f8fbff; font-size: 12pt; font-weight: 700;"
+        )
+        stats_layout.addWidget(title)
+
+        self.graph_popout_stats = {}
+        for label in (
+            "Total Hands",
+            "Net Won",
+            "All-in Adj Net Won",
+            "bb/100",
+            "All-in Adj bb/100",
+        ):
+            name_label = QLabel(label)
+            name_label.setStyleSheet(
+                "color: #8fa9c9; font-size: 9pt; font-weight: 600;"
+            )
+            value_label = QLabel("—")
+            value_label.setStyleSheet(
+                "color: #f8fbff; font-size: 13pt; font-weight: 700;"
+            )
+            value_label.setWordWrap(True)
+            stats_layout.addWidget(name_label)
+            stats_layout.addWidget(value_label)
+            self.graph_popout_stats[label] = value_label
+
+        filter_title = QLabel("Current Filters")
+        filter_title.setStyleSheet(
+            "color: #8fa9c9; font-size: 9pt; font-weight: 700;"
+        )
+        stats_layout.addWidget(filter_title)
+
+        self.graph_popout_filter_label = QLabel()
+        self.graph_popout_filter_label.setWordWrap(True)
+        self.graph_popout_filter_label.setTextInteractionFlags(
+            Qt.TextSelectableByMouse
+        )
+        self.graph_popout_filter_label.setStyleSheet(
+            "color: #fbbf24; font-size: 10pt;"
+        )
+        stats_layout.addWidget(
+            self.graph_popout_filter_label
+        )
+
+        popup_graph = ProfitGraph()
+        popup_graph.series = {
+            key: list(points)
+            for key, points in self.graph.series.items()
+        }
+        popup_graph.visible_series = set(
+            self.graph.visible_series
+        )
+        popup_graph.update()
+
+        layout.addWidget(popup_graph, 1)
+
+        # Overlay the compact results panel inside the graph so it does not
+        # consume horizontal space. The offset places it just inside the
+        # graph's upper-left plotting area.
+        stats_panel.setParent(popup_graph)
+        stats_panel.move(55, 55)
+
+        self.graph_popout = dialog
+        self.graph_popout_graph = popup_graph
+        self.graph_popout_stats_panel = stats_panel
+        self._refresh_graph_popout_stats()
+        stats_panel.show()
+        stats_panel.raise_()
+
+        def clear_graph_popout():
+            self.graph_popout = None
+            self.graph_popout_graph = None
+            self.graph_popout_stats = {}
+            self.graph_popout_filter_label = None
+            self.graph_popout_stats_panel = None
+
+        dialog.destroyed.connect(clear_graph_popout)
+        dialog.show()
+
     @staticmethod
     def _configure_table_columns(table: QTableWidget):
         """Set initial widths once, leaving later layout changes to the user."""
@@ -2472,6 +2856,20 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(
             self.delete_hands_button
         )
+
+        self.export_selected_hands_button = QPushButton(
+            "Export Selected Hands"
+        )
+        self.export_selected_hands_button.setToolTip(
+            "Export the selected hands as original CoinPoker hand histories"
+        )
+        self.export_selected_hands_button.clicked.connect(
+            self.export_selected_hands
+        )
+        toolbar.addWidget(
+            self.export_selected_hands_button
+        )
+
         replay_hint = QLabel(
             "Double-click a hand to open the replayer"
         )
@@ -2506,6 +2904,7 @@ class MainWindow(QMainWindow):
         )
 
         self._configure_table_columns(self.hand_table)
+        self._restore_table_header(self.hand_table, "hands")
         header = (
             self.hand_table
             .horizontalHeader()
@@ -2637,6 +3036,7 @@ class MainWindow(QMainWindow):
             ]
         )
         self._configure_table_columns(self.session_table)
+        self._restore_table_header(self.session_table, "sessions")
         self.session_table.horizontalHeaderItem(4).setToolTip(
             "Combined net winnings for the hands in this session"
         )
@@ -2696,6 +3096,23 @@ class MainWindow(QMainWindow):
         self.session_hand_limit_combo = self._add_hand_limit_control(
             hand_controls, self.show_selected_session_hands, "Session",
         )
+
+        self.export_session_hands_button = QPushButton(
+            "Export below hands"
+        )
+        self.export_session_hands_button.setToolTip(
+            "Export all hands currently loaded below, respecting the Show last limit"
+        )
+        self.export_session_hands_button.clicked.connect(
+            lambda: self._export_table_hands(
+                self.session_hand_table,
+                "coinpoker_session_hands.txt",
+            )
+        )
+        hand_controls.addWidget(
+            self.export_session_hands_button
+        )
+
         hands_layout.addLayout(hand_controls)
 
         self.session_hand_table = QTableWidget(
@@ -2706,6 +3123,7 @@ class MainWindow(QMainWindow):
             HAND_TABLE_HEADERS
         )
         self._configure_table_columns(self.session_hand_table)
+        self._restore_table_header(self.session_hand_table, "session_hands")
         session_hand_header = (
             self.session_hand_table
             .horizontalHeader()
@@ -2832,11 +3250,29 @@ class MainWindow(QMainWindow):
         self.group_hand_limit_combo = self._add_hand_limit_control(
             hand_controls, self.show_selected_group_hands, "Group",
         )
+
+        self.export_group_hands_button = QPushButton(
+            "Export below hands"
+        )
+        self.export_group_hands_button.setToolTip(
+            "Export all hands currently loaded below, respecting the Show last limit"
+        )
+        self.export_group_hands_button.clicked.connect(
+            lambda: self._export_table_hands(
+                self.group_hand_table,
+                "coinpoker_group_hands.txt",
+            )
+        )
+        hand_controls.addWidget(
+            self.export_group_hands_button
+        )
+
         hands_layout.addLayout(hand_controls)
 
         self.group_hand_table = QTableWidget(0, len(HAND_TABLE_HEADERS))
         self.group_hand_table.setHorizontalHeaderLabels(HAND_TABLE_HEADERS)
         self._configure_table_columns(self.group_hand_table)
+        self._restore_table_header(self.group_hand_table, "group_hands")
         hand_header = self.group_hand_table.horizontalHeader()
         hand_header.setSortIndicator(0, Qt.DescendingOrder)
         self.group_hand_table.setAlternatingRowColors(True)
@@ -2854,6 +3290,171 @@ class MainWindow(QMainWindow):
         self.group_splitter.setSizes([310, 360])
         lay.addWidget(self.group_splitter)
         self.tabs.addTab(w, "Group By")
+
+    def export_all_hands(self):
+        self._start_export(
+            "coinpoker_all_hands.txt"
+        )
+
+    def export_filtered_hands(self):
+        self._start_export(
+            "coinpoker_filtered_hands.txt",
+            filters=self.filters.filters(),
+        )
+
+    def export_selected_hands(self):
+        selected_rows = sorted(
+            {
+                index.row()
+                for index
+                in self.hand_table
+                .selectionModel()
+                .selectedRows()
+            }
+        )
+
+        hand_ids = [
+            self.hand_table.item(row, 1).text()
+            for row in selected_rows
+            if self.hand_table.item(row, 1) is not None
+        ]
+
+        if not hand_ids:
+            QMessageBox.warning(
+                self,
+                "Export selected hands",
+                "Select one or more hands to export first.",
+            )
+            return
+
+        self._start_export(
+            "coinpoker_selected_hands.txt",
+            hand_ids=hand_ids,
+        )
+
+    def _export_table_hands(self, table, filename):
+        # Logical column 1 remains the Hand ID even if the user visually
+        # reorders columns. Export every hand currently loaded in this table.
+        hand_ids = [
+            table.item(row, 1).text()
+            for row in range(table.rowCount())
+            if table.item(row, 1) is not None
+        ]
+
+        if not hand_ids:
+            QMessageBox.information(
+                self,
+                "Export hands",
+                "There are no hands loaded in the table below.",
+            )
+            return
+
+        self._start_export(
+            filename,
+            hand_ids=hand_ids,
+        )
+
+    def _start_export(self, filename, *, filters=None, hand_ids=None):
+        if self.export_worker is not None:
+            if self.export_dialog is not None:
+                self.export_dialog.raise_()
+                self.export_dialog.activateWindow()
+            return
+
+        save_dialog = QFileDialog(
+            self,
+            "Export CoinPoker hand histories",
+            filename,
+        )
+        save_dialog.setAcceptMode(
+            QFileDialog.AcceptSave
+        )
+        save_dialog.setNameFilter(
+            "Hand-history text files (*.txt)"
+        )
+        save_dialog.setDefaultSuffix(
+            "txt"
+        )
+
+        if save_dialog.exec() != QDialog.Accepted:
+            return
+
+        path = save_dialog.selectedFiles()[0]
+
+        self.export_dialog = ExportProgressDialog(
+            self
+        )
+        self.export_worker = ExportWorker(
+            self.db_path,
+            path,
+            filters=filters,
+            hand_ids=hand_ids,
+            parent=self,
+        )
+
+        self.export_dialog.cancel_requested.connect(
+            self.export_worker.requestInterruption
+        )
+        self.export_worker.progress_changed.connect(
+            self.export_dialog.update_progress
+        )
+        self.export_worker.finished.connect(
+            self._export_finished
+        )
+
+        self.export_dialog.show()
+        self.export_worker.start()
+
+    @Slot()
+    def _export_finished(self):
+        worker = self.export_worker
+        dialog = self.export_dialog
+
+        self.export_worker = None
+        self.export_dialog = None
+
+        if dialog is not None:
+            dialog.accept()
+            dialog.deleteLater()
+
+        if worker is None:
+            return
+
+        worker.deleteLater()
+
+        if self._close_after_export:
+            self.close()
+            return
+
+        if worker.error:
+            QMessageBox.warning(
+                self,
+                "Export failed",
+                "The hand histories could not be exported.\n\n"
+                + worker.error,
+            )
+        elif worker.cancelled:
+            self.statusBar().showMessage(
+                "Export cancelled.",
+                10000,
+            )
+        elif not worker.exported_count:
+            QMessageBox.information(
+                self,
+                "Export hands",
+                "No hands match this export. No file was written.",
+            )
+        else:
+            self.statusBar().showMessage(
+                f"Exported {worker.exported_count:,} hands to {worker.target}",
+                15000,
+            )
+            QMessageBox.information(
+                self,
+                "Export complete",
+                f"Exported {worker.exported_count:,} hands to:\n"
+                f"{worker.target}",
+            )
 
     def choose_file(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -3085,6 +3686,8 @@ class MainWindow(QMainWindow):
         for k, v in vals.items():
             self.cards[k].value.setText(v)
 
+        self._refresh_graph_popout_stats()
+
         graph_rows = self.db.profit_points(f)
 
         net_changes = [
@@ -3152,6 +3755,16 @@ class MainWindow(QMainWindow):
             allin_adj=allin_adj_changes,
             nonshowdown=nonshowdown_changes,
         )
+        if (
+            getattr(self, "graph_popout_graph", None) is not None
+        ):
+            self.graph_popout_graph.set_series_changes(
+                net=net_changes,
+                net_post_rb=net_post_rb_changes,
+                showdown=showdown_changes,
+                allin_adj=allin_adj_changes,
+                nonshowdown=nonshowdown_changes,
+            )
 
         self.refresh_hands(f)
         self.refresh_sessions(f)
@@ -3872,6 +4485,12 @@ class MainWindow(QMainWindow):
                 # Each grouping has different columns. Restore its own layout
                 # before rendering so its saved sort choice takes precedence.
                 state = self._group_column_states.get(group_by)
+                if state is None:
+                    state = self.settings.value(
+                        f"table_layouts/group_by/{group_by}"
+                    )
+                    if state is not None:
+                        self._group_column_states[group_by] = state
                 layout_restored = state is not None and header.restoreState(state)
                 if not layout_restored:
                     for column in range(len(columns)):

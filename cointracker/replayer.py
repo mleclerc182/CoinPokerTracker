@@ -182,10 +182,24 @@ class PokerTableWidget(QWidget):
         )
         painter.setPen(QColor("#dcecff"))
         painter.drawText(
-            QRectF(rect.left() + 11, rect.top() + 59, 101, 21),
+            QRectF(rect.left() + 11, rect.top() + 55, 101, 20),
             Qt.AlignLeft | Qt.AlignVCenter,
             format_chips(self.frame.stacks.get(seat.player, 0)),
         )
+
+        equity = self.frame.equities.get(seat.player)
+        if equity is not None and not is_folded:
+            equity_font = painter.font()
+            equity_font.setPointSize(8)
+            equity_font.setBold(True)
+            painter.setFont(equity_font)
+            painter.setPen(QColor("#7dd3fc"))
+            painter.drawText(
+                QRectF(rect.left() + 11, rect.top() + 73, 101, 17),
+                Qt.AlignLeft | Qt.AlignVCenter,
+                f"Equity {equity * 100:.1f}%",
+            )
+
         painter.restore()
 
         bet = self.frame.street_bets.get(seat.player, 0)
@@ -269,10 +283,19 @@ class PokerTableWidget(QWidget):
         )
 
         if self.replay.splash_cents:
+            # Keep SPLASH / MEGA SPLASH above the community cards so the
+            # badge does not compete with the pot and betting/action area.
+            if visible_boards:
+                splash_y = first_y - 42
+            else:
+                # Before the board is dealt, reserve the same upper-table
+                # region where the badge will remain once cards appear.
+                splash_y = table_center.y() - 90
+
             splash_rect = QRectF(
-                pot_rect.left(),
-                pot_rect.bottom() + 6,
-                pot_rect.width(),
+                table_center.x() - 100,
+                splash_y,
+                200,
                 32,
             )
             painter.setPen(QPen(QColor("#fbbf24"), 1))
