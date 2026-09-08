@@ -14,34 +14,79 @@ Open the latest release and download:
 
 `CoinPokerTracker-Setup.exe`
 
-> **Windows SmartScreen:** The installer may currently show an "unrecognized app" warning because the application as it builds reputation. You will need to click "More Info" and choose **Run anyway**.
-
+> **Windows SmartScreen:** The installer may currently show an "unrecognized app" warning because the application may not yet have built enough reputation with Microsoft Defender SmartScreen. Click **More info**, then choose **Run anyway**.
 ## Discord
 
-For additional information or any questions feel free to join the **[Discord](https://discord.gg/e5B3hGJzj5)**
+For additional information or questions, feel free to join the **[Discord](https://discord.gg/e5B3hGJzj5)**.
 
-![Project Screenshot](assets/Overview.png)
-![Project Screenshot](assets/Replayer.png)
-![Project Screenshot](assets/Session.png)
+## Preview
+
+<p align="center">
+  <a href="assets/Overview.png">
+    <img src="assets/Overview.png" alt="CoinPoker Tracker overview" width="900">
+  </a>
+</p>
+
+<p align="center"><sub>Overview, statistics, filters, and profit graph. Click the image to view it full size.</sub></p>
+
+<details>
+<summary style="font-size: 20px;">
+  <strong>View more screenshots</strong>
+</summary>
+<br>
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <a href="assets/Replayer.png">
+        <img src="assets/Replayer.png" alt="CoinPoker Tracker hand replayer" width="100%">
+      </a>
+      <br>
+      <sub><strong>Hand Replayer</strong></sub>
+    </td>
+    <td width="50%" align="center">
+      <a href="assets/Position.png">
+        <img src="assets/Position.png" alt="CoinPoker Tracker position results" width="100%">
+      </a>
+      <br>
+      <sub><strong>Group By Position</strong></sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <a href="assets/Stakes.png">
+        <img src="assets/Stakes.png" alt="CoinPoker Tracker stakes results" width="100%">
+      </a>
+      <br>
+      <sub><strong>Group By Stakes</strong></sub>
+    </td>
+    <td width="50%" align="center">
+      <a href="assets/Session.png">
+        <img src="assets/Session.png" alt="CoinPoker Tracker session results" width="100%">
+      </a>
+      <br>
+      <sub><strong>Session Results</strong></sub>
+    </td>
+  </tr>
+</table>
+
+</details>
 
 ## What it does
 
 CoinPoker Tracker currently provides:
 
 - Import of CoinPoker cash-game hand-history files
-- Duplicate-safe hand importing
 - Graphical hand replayer with action-by-action playback
 - Profit graphs
-- Overall winnings and bb/100
-- VPIP, PFR, 3-Bet, WWSF, WTSD, and W$SD
-- All-in adjusted results
+- Customizable Overview stat cards
+- VPIP, PFR, 3-Bet, WWSF, WTSD, and W$SD, All in adjusted and more
+- Group By tabs where you can view results for Position,Stakes,and Starting hands as well as view hands for each one
 - Splash-pot tracking
 - Run-it-twice / multi-run tracking
 - Session results with per-session hand drill-down
-- Position results
 - Individual hand-history viewing
 - Application-wide date, stakes, Splash, runout, and Hero-contribution filtering
-- Customizable Overview stat cards
 - Local SQLite database storage
 
 Your hand histories and tracker database stay on your computer. The tracker does not require your CoinPoker login credentials.
@@ -148,7 +193,6 @@ If CoinPoker Tracker has been useful to you and you would like to support the pr
 **[☕ Buy me a coffee](https://buymeacoffee.com/mleclerc182)**
 
 Thank you for using CoinPoker Tracker, and thank you for any bug reports or feature suggestions that help make it better.
-
 
 ## Disclaimer
 
