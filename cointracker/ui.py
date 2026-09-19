@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -9,7 +10,7 @@ from PySide6.QtGui import QAction, QColor, QDoubleValidator, QFont, QPainter, QP
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCalendarWidget, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel,
-    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
+    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
     QPushButton, QSplitter, QStyledItemDelegate, QStyle, QStyleOptionViewItem, QTabWidget, QTableWidget,
     QTableWidgetItem, QToolTip, QVBoxLayout, QWidget
 )
@@ -55,6 +56,7 @@ CARD_ACCENTS = {
 
 DEFAULT_HAND_LIMIT = 1000
 HAND_LIMIT_OPTIONS = (500, 1000, 2500, 5000, 10000, -1)
+RECENT_FILTER_LIMIT = 5
 
 HAND_TABLE_HEADERS = [
     "Date",
@@ -447,6 +449,11 @@ class ProfitGraph(QWidget):
             "net": [0.0],
             "net_post_rb": [0.0],
         }
+        self.units = "cash"
+        self._cash_series = self.series
+        self._bb_series = {
+            key: [0.0] for key in self.series
+        }
         self.visible_series = set(self.series)
         self.setMinimumHeight(260)
 
@@ -465,20 +472,69 @@ class ProfitGraph(QWidget):
         self,
         *,
         net: list[float],
-        net_post_rb: list[float],
+        net_post_rb: list[float] | None = None,
         showdown: list[float],
         allin_adj: list[float],
         nonshowdown: list[float],
+        bb_cents: list[float] | None = None,
+        rakeback_bb: float = 0.0,
     ):
-        self.series = {
-            "showdown": self._cumulative(showdown),
-            "allin_adj": self._cumulative(allin_adj),
-            "nonshowdown": self._cumulative(nonshowdown),
-            "net": self._cumulative(net),
-            "net_post_rb": self._cumulative(net_post_rb),
+        changes = {
+            "showdown": showdown,
+            "allin_adj": allin_adj,
+            "nonshowdown": nonshowdown,
+            "net": net,
+            "net_post_rb": net if net_post_rb is None else net_post_rb,
+        }
+        self._cash_series = {
+            key: self._cumulative(values)
+            for key, values in changes.items()
+        }
+        self._bb_series = {
+            key: [0.0] for key in changes
         }
 
+        if bb_cents is not None:
+            if any(len(values) != len(bb_cents) for values in changes.values()):
+                raise ValueError("Each graph hand must have a matching big blind.")
+            for key, values in changes.items():
+                if key == "net_post_rb":
+                    continue
+                self._bb_series[key] = self._cumulative([
+                    float(value) / bb if bb > 0 else 0.0
+                    for value, bb in zip(values, bb_cents)
+                ])
+
+            # Manual rakeback is stored per stake. Use its BB equivalent,
+            # spread evenly over the selected hands, just like the cash view.
+            self._bb_series["net_post_rb"] = [0.0] + [
+                total + rakeback_bb * (hands / len(net))
+                for hands, total in enumerate(self._bb_series["net"][1:], 1)
+            ]
+
+        self.set_units(self.units)
+
+    def set_units(self, units: str):
+        self.units = "bb" if units == "bb" else "cash"
+        self.series = (
+            self._bb_series if self.units == "bb" else self._cash_series
+        )
         self.update()
+
+    def copy_series_from(self, other: ProfitGraph):
+        # Cached points are replaced on refresh, never mutated. Sharing them
+        # keeps the popout in sync without duplicating large hand histories.
+        self._cash_series = other._cash_series
+        self._bb_series = other._bb_series
+        self.set_units(other.units)
+
+    def _axis_label(self, value: float, step: float) -> str:
+        if self.units == "cash":
+            return fmt_money(int(round(value)))
+        decimals = max(2, int(math.ceil(-math.log10(step))))
+        if abs(value) < step * 1e-8:
+            value = 0.0
+        return f"{value:,.{decimals}f}"
 
     def set_series_visible(self, key: str, visible: bool):
         if visible:
@@ -497,7 +553,16 @@ class ProfitGraph(QWidget):
         lo: float,
         hi: float,
         target_ticks: int = 8,
+        *,
+        units: str = "cash",
     ) -> tuple[float, float, float]:
+        if units == "bb":
+            if lo == hi:
+                pad = max(1.0, abs(lo) * 0.1)
+                lo -= pad
+                hi += pad
+            step = nice_step(hi - lo, target_ticks)
+            return math.floor(lo / step) * step, math.ceil(hi / step) * step, step
         return money_axis_bounds(lo, hi, target_ticks)
 
     @staticmethod
@@ -508,7 +573,7 @@ class ProfitGraph(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.fillRect(self.rect(), QColor("#0d1627"))
-        rect = self.rect().adjusted(12, 15, -86, -38)
+        rect = self.rect().adjusted(12, 30, -86, -38)
 
         available = [
             (key, points)
@@ -543,7 +608,22 @@ class ProfitGraph(QWidget):
             min(values),
             max(values),
             8,
+            units=self.units,
         )
+
+        axis_title = "Total BB" if self.units == "bb" else "Cash (₮)"
+        axis_width = max(
+            86,
+            max(
+                p.fontMetrics().horizontalAdvance(label)
+                for label in (
+                    axis_title,
+                    self._axis_label(axis_lo, y_step),
+                    self._axis_label(axis_hi, y_step),
+                )
+            ) + 14,
+        )
+        rect.setRight(self.width() - axis_width)
 
         axis_span = axis_hi - axis_lo
         hands = max(len(points) for _, points in available) - 1
@@ -552,6 +632,10 @@ class ProfitGraph(QWidget):
         grid_pen.setStyle(Qt.DotLine)
 
         text_pen = QPen(QColor("#b8c7e0"))
+        p.setPen(text_pen)
+        title_rect = self.rect().adjusted(rect.right() + 8, 0, -2, 0)
+        title_rect.setHeight(20)
+        p.drawText(title_rect, Qt.AlignLeft | Qt.AlignVCenter, axis_title)
         tick_len = 5
         y = axis_lo
 
@@ -575,7 +659,7 @@ class ProfitGraph(QWidget):
                 int(py),
             )
 
-            label = fmt_money(int(round(y)))
+            label = self._axis_label(y, y_step)
 
             label_rect = self.rect().adjusted(
                 rect.right() + 8,
@@ -1182,6 +1266,7 @@ class FiltersBar(QWidget):
         # No fake year-2000 sentinel is used.
         self.date_from = OptionalDatePicker()
         self.date_to = OptionalDatePicker()
+        self._date_preset = None
 
         self.all_dates_button = QPushButton(
             "All Dates"
@@ -1196,7 +1281,8 @@ class FiltersBar(QWidget):
             "Today"
         )
         self.today_button.setToolTip(
-            "Show hands played today"
+            "Show hands played today. Recent filters will use the current "
+            "day whenever you reapply this combination."
         )
         self.today_button.clicked.connect(
             self.show_today
@@ -1249,10 +1335,10 @@ class FiltersBar(QWidget):
             control.setToolTip(tooltip)
             control.setClearButtonEnabled(True)
         self.date_from.dateChanged.connect(
-            self.changed.emit
+            self._date_changed
         )
         self.date_to.dateChanged.connect(
-            self.changed.emit
+            self._date_changed
         )
         self.stakes.currentIndexChanged.connect(
             lambda _index: self.changed.emit()
@@ -1310,21 +1396,29 @@ class FiltersBar(QWidget):
 
         self.refresh_stakes(db)
 
-    def show_today(self):
-        today = QDate.currentDate()
-
-        self.date_from.blockSignals(True)
-        self.date_to.blockSignals(True)
-
-        self.date_from.setDate(today)
-        self.date_to.setDate(today)
-
-        self.date_from.blockSignals(False)
-        self.date_to.blockSignals(False)
-
+    def _date_changed(self):
+        # Choosing a custom date leaves the relative Today preset.
+        self._date_preset = None
         self.changed.emit()
 
+    def show_today(self):
+        self._date_preset = "today"
+        self._refresh_relative_dates()
+        self.changed.emit()
+
+    def _refresh_relative_dates(self):
+        if self._date_preset != "today":
+            return
+        today = QDate.currentDate()
+        for control in (self.date_from, self.date_to):
+            was_blocked = control.blockSignals(True)
+            try:
+                control.setDate(today)
+            finally:
+                control.blockSignals(was_blocked)
+
     def show_all_dates(self):
+        self._date_preset = None
         self.date_from.blockSignals(True)
         self.date_to.blockSignals(True)
         self.date_from.clearDate()
@@ -1336,29 +1430,95 @@ class FiltersBar(QWidget):
         self.changed.emit()
 
     def clear_all(self):
-        controls = [
-            self.date_from,
-            self.date_to,
-            self.stakes,
-            self.splash,
-            self.runs,
-            self.bb_contributed_min,
-            self.bb_contributed_max,
-        ]
-        for control in controls:
-            control.blockSignals(True)
+        self.set_filters({})
 
-        self.date_from.clearDate()
-        self.date_to.clearDate()
-        self.stakes.setCurrentIndex(0)
-        self.splash.setCurrentIndex(0)
-        self.runs.setCurrentIndex(0)
-        self.bb_contributed_min.clear()
-        self.bb_contributed_max.clear()
+    @staticmethod
+    def normalize_filters(value) -> dict | None:
+        """Validate saved settings before restoring any controls."""
+        keys = {
+            "date_from", "date_to", "sb_cents", "bb_cents", "splash", "runs",
+            "contributed_bb_min", "contributed_bb_max", "date_preset",
+        }
+        if not isinstance(value, dict) or not set(value).issubset(keys):
+            return None
+        result = dict(value)
+        result.setdefault("splash", "all")
+        result.setdefault("runs", "all")
+        if result["splash"] not in ("all", "only", "exclude"):
+            return None
+        if result["runs"] not in ("all", "once", "multi"):
+            return None
+        if "date_preset" in result:
+            if result["date_preset"] != "today":
+                return None
+            # Store relative intent, not the date when Today was first used.
+            result.pop("date_from", None)
+            result.pop("date_to", None)
+        for key in ("date_from", "date_to"):
+            if key in result:
+                date = result[key]
+                if not isinstance(date, str):
+                    return None
+                parsed = QDate.fromString(date, "yyyy-MM-dd")
+                if not parsed.isValid() or parsed.toString("yyyy-MM-dd") != date:
+                    return None
+        if ("sb_cents" in result) != ("bb_cents" in result):
+            return None
+        for key in ("sb_cents", "bb_cents"):
+            if key in result:
+                amount = result[key]
+                if type(amount) is not int or not 0 <= amount <= 2**63 - 1:
+                    return None
+        for key in ("contributed_bb_min", "contributed_bb_max"):
+            if key in result:
+                amount = result[key]
+                if type(amount) not in (int, float) or not 0 <= amount <= 1_000_000:
+                    return None
+        return result
 
-        for control in controls:
-            control.blockSignals(False)
+    def set_filters(self, value: dict):
+        """Replace all filters and refresh listeners once, after restoration."""
+        f = self.normalize_filters(value)
+        if f is None:
+            raise ValueError("Invalid filter combination")
+        was_blocked = self.blockSignals(True)
+        try:
+            for key, control in (
+                ("date_from", self.date_from),
+                ("date_to", self.date_to),
+            ):
+                if key in f:
+                    control.setDate(QDate.fromString(f[key], "yyyy-MM-dd"))
+                else:
+                    control.clearDate()
+            self._select_stakes(f.get("sb_cents"), f.get("bb_cents"))
+            self.splash.setCurrentIndex({"all": 0, "only": 1, "exclude": 2}[f["splash"]])
+            self.runs.setCurrentIndex({"all": 0, "once": 1, "multi": 2}[f["runs"]])
+            for key, control in (
+                ("contributed_bb_min", self.bb_contributed_min),
+                ("contributed_bb_max", self.bb_contributed_max),
+            ):
+                control.setText(str(f[key]) if key in f else "")
+            self._date_preset = f.get("date_preset")
+            self._refresh_relative_dates()
+        finally:
+            self.blockSignals(was_blocked)
         self.changed.emit()
+
+    def _select_stakes(self, sb, bb):
+        for index in range(self.stakes.count()):
+            if (
+                self.stakes.itemData(index) == bb
+                and self.stakes.itemData(index, Qt.UserRole + 1) == sb
+            ):
+                self.stakes.setCurrentIndex(index)
+                return
+        if bb is not None:
+            # Keep the exact saved stake even if its hands have been deleted.
+            self.stakes.addItem(f"{fmt_money(sb)}/{fmt_money(bb)}", bb)
+            index = self.stakes.count() - 1
+            self.stakes.setItemData(index, sb, Qt.UserRole + 1)
+            self.stakes.setCurrentIndex(index)
 
     def refresh_stakes(
         self,
@@ -1383,17 +1543,13 @@ class FiltersBar(QWidget):
                 self.stakes.count() - 1, sb, Qt.UserRole + 1,
             )
 
-        for index in range(self.stakes.count()):
-            if (
-                self.stakes.itemData(index) == old
-                and self.stakes.itemData(index, Qt.UserRole + 1) == old_sb
-            ):
-                self.stakes.setCurrentIndex(index)
-                break
+        self._select_stakes(old_sb, old)
 
         self.stakes.blockSignals(False)
 
     def filters(self) -> dict:
+        # Database queries always receive concrete dates, even after midnight.
+        self._refresh_relative_dates()
         f = {}
         if self.date_from.has_date():
             f["date_from"] = (
@@ -1451,17 +1607,28 @@ class FiltersBar(QWidget):
         except ValueError:
             return None
 
+    def filter_state(self) -> dict:
+        """Return a reusable combination, preserving relative date presets."""
+        f = self.filters()
+        if self._date_preset == "today":
+            f.pop("date_from", None)
+            f.pop("date_to", None)
+            f["date_preset"] = "today"
+        return f
+
     def summary(self) -> str:
+        return self.summary_for_filters(self.filter_state())
+
+    @staticmethod
+    def summary_for_filters(f: dict) -> str:
         parts = []
-        has_from = self.date_from.has_date()
-        has_to = self.date_to.has_date()
-        if has_from and has_to:
-            date_from = self.date_from.date().toString(
-                "yyyy-MM-dd"
-            )
-            date_to = self.date_to.date().toString(
-                "yyyy-MM-dd"
-            )
+        has_from = "date_from" in f
+        has_to = "date_to" in f
+        if f.get("date_preset") == "today":
+            parts.append("Today")
+        elif has_from and has_to:
+            date_from = f["date_from"]
+            date_to = f["date_to"]
             if date_from == date_to:
                 parts.append(
                     date_from
@@ -1473,44 +1640,36 @@ class FiltersBar(QWidget):
         elif has_from:
             parts.append(
                 "From "
-                + self.date_from.date().toString(
-                    "yyyy-MM-dd"
-                )
+                + f["date_from"]
             )
         elif has_to:
             parts.append(
                 "Through "
-                + self.date_to.date().toString(
-                    "yyyy-MM-dd"
-                )
+                + f["date_to"]
             )
 
-        if self.stakes.currentData() is not None:
+        if f.get("bb_cents") is not None:
             parts.append(
-                self.stakes.currentText()
+                f"{fmt_money(f['sb_cents'])}/{fmt_money(f['bb_cents'])}"
             )
-        if self.splash.currentIndex() == 1:
+        if f.get("splash") == "only":
             parts.append(
                 "Splash only"
             )
-        elif self.splash.currentIndex() == 2:
+        elif f.get("splash") == "exclude":
             parts.append(
                 "No splash pots"
             )
-        if self.runs.currentIndex() == 1:
+        if f.get("runs") == "once":
             parts.append(
                 "Run once"
             )
-        elif self.runs.currentIndex() == 2:
+        elif f.get("runs") == "multi":
             parts.append(
                 "Multi-run only"
             )
-        contributed_min = self._optional_bb_value(
-            self.bb_contributed_min
-        )
-        contributed_max = self._optional_bb_value(
-            self.bb_contributed_max
-        )
+        contributed_min = f.get("contributed_bb_min")
+        contributed_max = f.get("contributed_bb_max")
         if (
             contributed_min is not None
             and contributed_max is not None
@@ -1549,7 +1708,8 @@ class FiltersDialog(QDialog):
         lay = QVBoxLayout(self)
         help_text = QLabel(
             "These filters apply to Overview, Hands, Sessions, and Position. "
-            "Changes are applied immediately."
+            "Changes are applied immediately. Close this editor to save the "
+            "combination in Recent filters for quick reuse."
         )
         help_text.setWordWrap(True)
         help_text.setStyleSheet(
@@ -1597,6 +1757,7 @@ class MainWindow(QMainWindow):
             "OpenAI",
             "CoinPokerTracker",
         )
+        self.recent_filters = self._load_recent_filters()
 
         self.hero_name = self.settings.value(
             "hero_name",
@@ -1609,7 +1770,7 @@ class MainWindow(QMainWindow):
         self._close_after_export = False
 
         self.setWindowTitle(
-            "CoinPoker Tracker v1.0.7"
+            "CoinPoker Tracker v1.0.8"
         )
         self.resize(
             1280,
@@ -1628,6 +1789,11 @@ class MainWindow(QMainWindow):
             self.filters,
             self,
         )
+        self.filters_dialog.finished.connect(self._remember_current_filters)
+
+        self.recent_filters_menu = QMenu("Recent filters", self)
+        self.recent_filters_menu.setToolTipsVisible(True)
+        self._refresh_recent_filters_menu()
 
         self.filter_summary_label = QLabel()
         self.filter_summary_label.setMaximumWidth(
@@ -1866,6 +2032,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
 
+        self._remember_current_filters()
         self._save_table_layouts()
         self.db.close()
         super().closeEvent(event)
@@ -2012,6 +2179,9 @@ class MainWindow(QMainWindow):
         filters_menu = self.menuBar().addMenu(
             "Filters"
         )
+
+        filters_menu.addMenu(self.recent_filters_menu)
+        filters_menu.addSeparator()
         edit_filters = QAction(
             "Edit filters…",
             self,
@@ -2033,6 +2203,56 @@ class MainWindow(QMainWindow):
         filters_menu.addAction(
             self.clear_filters_action
         )
+
+
+    def _load_recent_filters(self) -> list[dict]:
+        try:
+            stored = json.loads(self.settings.value("filters/recent", "[]"))
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(stored, list):
+            return []
+        recent = []
+        for value in stored:
+            f = FiltersBar.normalize_filters(value)
+            if f is None or f == {"splash": "all", "runs": "all"} or f in recent:
+                continue
+            recent.append(f)
+            if len(recent) == RECENT_FILTER_LIMIT:
+                break
+        return recent
+
+    def _remember_current_filters(self):
+        # Filter controls apply live. Save only the completed combination,
+        # so editing dates or typing a BB amount cannot fill the history.
+        f = self.filters.normalize_filters(self.filters.filter_state())
+        if f is None or f == {"splash": "all", "runs": "all"}:
+            return
+        recent = [f] + [entry for entry in self.recent_filters if entry != f]
+        recent = recent[:RECENT_FILTER_LIMIT]
+        if recent != self.recent_filters:
+            self.recent_filters = recent
+            self.settings.setValue("filters/recent", json.dumps(recent))
+            self.settings.sync()
+            self._refresh_recent_filters_menu()
+
+    def _refresh_recent_filters_menu(self):
+        self.recent_filters_menu.clear()
+        for index, f in enumerate(self.recent_filters, start=1):
+            summary = self.filters.summary_for_filters(f)
+            label = self.fontMetrics().elidedText(summary, Qt.ElideMiddle, 640)
+            action = self.recent_filters_menu.addAction(f"{index}. {label}")
+            action.setToolTip(summary)
+            action.triggered.connect(
+                lambda _checked=False, saved=dict(f): self._apply_recent_filter(saved)
+            )
+        if not self.recent_filters:
+            empty = self.recent_filters_menu.addAction("No recent filters yet")
+            empty.setEnabled(False)
+
+    def _apply_recent_filter(self, f: dict):
+        self.filters.set_filters(f)
+        self._remember_current_filters()
 
     def open_filters(self):
         self.filters.refresh_stakes(
@@ -2176,6 +2396,18 @@ class MainWindow(QMainWindow):
 
         graph_controls.addStretch(1)
 
+        self.graph_units = self.settings.value("overview/graph/units", "cash")
+        if self.graph_units == "bb100":
+            # Migrate the previous graph selection to cumulative big blinds.
+            self.graph_units = "bb"
+            self.settings.setValue("overview/graph/units", self.graph_units)
+            self.settings.sync()
+        if self.graph_units not in {"cash", "bb"}:
+            self.graph_units = "cash"
+        self.graph_units_combo = self._create_graph_units_combo()
+        graph_controls.addWidget(QLabel("Units:"))
+        graph_controls.addWidget(self.graph_units_combo)
+
         self.graph_popout_button = QPushButton("Pop out graph")
         self.graph_popout_button.setToolTip(
             "Open the profit graph in a large window with normal window controls."
@@ -2192,8 +2424,14 @@ class MainWindow(QMainWindow):
         )
 
         self.graph = ProfitGraph()
+        self.graph.set_units(self.graph_units)
         self.graph_popout = None
         self.graph_popout_graph = None
+        self.graph_popout_units_combo = None
+        self.graph_popout_stats_check = None
+        self.graph_popout_show_stats = self.settings.value(
+            "overview/graph/popout_show_stats", True, type=bool
+        )
         self.graph_popout_stats = {}
         self.graph_popout_filter_label = None
         self.graph_popout_stats_panel = None
@@ -2424,6 +2662,44 @@ class MainWindow(QMainWindow):
         )
         self.refresh_all()
 
+    def _create_graph_units_combo(self) -> QComboBox:
+        combo = QComboBox()
+        combo.addItem("Cash (₮)", "cash")
+        combo.addItem("Total BB", "bb")
+        combo.setToolTip(
+            "Cash shows cumulative winnings. Total BB shows cumulative big "
+            "blinds won: each hand's winnings divided by its own big blind, "
+            "then added to the running total."
+        )
+        combo.setCurrentIndex(combo.findData(self.graph_units))
+        combo.currentIndexChanged.connect(
+            lambda _index: self._graph_units_changed(combo.currentData())
+        )
+        return combo
+
+    def _graph_units_changed(self, units: str):
+        self.graph_units = "bb" if units == "bb" else "cash"
+        self.settings.setValue("overview/graph/units", self.graph_units)
+        self.settings.sync()
+        for name in ("graph", "graph_popout_graph"):
+            graph = getattr(self, name, None)
+            if graph is not None:
+                graph.set_units(self.graph_units)
+        for name in ("graph_units_combo", "graph_popout_units_combo"):
+            combo = getattr(self, name, None)
+            if combo is not None:
+                blocked = combo.blockSignals(True)
+                combo.setCurrentIndex(combo.findData(self.graph_units))
+                combo.blockSignals(blocked)
+
+    def _graph_popout_stats_visibility_changed(self, checked: bool):
+        self.graph_popout_show_stats = bool(checked)
+        self.settings.setValue(
+            "overview/graph/popout_show_stats", self.graph_popout_show_stats
+        )
+        self.settings.sync()
+        self._refresh_graph_popout_stats()
+
     def _graph_visibility_changed(
         self,
         key: str,
@@ -2493,8 +2769,10 @@ class MainWindow(QMainWindow):
             None,
         )
         if stats_panel is not None:
-            stats_panel.adjustSize()
-            stats_panel.raise_()
+            stats_panel.setVisible(self.graph_popout_show_stats)
+            if self.graph_popout_show_stats:
+                stats_panel.adjustSize()
+                stats_panel.raise_()
 
     def show_graph_popout(self):
         if self.graph_popout is not None:
@@ -2537,7 +2815,23 @@ class MainWindow(QMainWindow):
 
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(0)
+        layout.setSpacing(8)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Units:"))
+        self.graph_popout_units_combo = self._create_graph_units_combo()
+        controls.addWidget(self.graph_popout_units_combo)
+        self.graph_popout_stats_check = QCheckBox("Show overview stats")
+        self.graph_popout_stats_check.setToolTip(
+            "Show or hide the results and filters overlay in this window."
+        )
+        self.graph_popout_stats_check.setChecked(self.graph_popout_show_stats)
+        self.graph_popout_stats_check.toggled.connect(
+            self._graph_popout_stats_visibility_changed
+        )
+        controls.addWidget(self.graph_popout_stats_check)
+        controls.addStretch(1)
+        layout.addLayout(controls)
 
         stats_panel = QFrame()
         stats_panel.setObjectName("graphPopoutStats")
@@ -2605,10 +2899,7 @@ class MainWindow(QMainWindow):
         )
 
         popup_graph = ProfitGraph()
-        popup_graph.series = {
-            key: list(points)
-            for key, points in self.graph.series.items()
-        }
+        popup_graph.copy_series_from(self.graph)
         popup_graph.visible_series = set(
             self.graph.visible_series
         )
@@ -2626,12 +2917,12 @@ class MainWindow(QMainWindow):
         self.graph_popout_graph = popup_graph
         self.graph_popout_stats_panel = stats_panel
         self._refresh_graph_popout_stats()
-        stats_panel.show()
-        stats_panel.raise_()
 
         def clear_graph_popout():
             self.graph_popout = None
             self.graph_popout_graph = None
+            self.graph_popout_units_combo = None
+            self.graph_popout_stats_check = None
             self.graph_popout_stats = {}
             self.graph_popout_filter_label = None
             self.graph_popout_stats_panel = None
@@ -3688,7 +3979,13 @@ class MainWindow(QMainWindow):
 
         self._refresh_graph_popout_stats()
 
-        graph_rows = self.db.profit_points(f)
+        # Include each hand's blind for mixed-stake BB totals, reusing the
+        # database's normal filter builder and chronological graph order.
+        where, params = self.db._where(f)
+        graph_rows = self.db.conn.execute(
+            "SELECT hero_net_cents, hero_allin_adj_cents, hero_wtsd, bb_cents "
+            f"FROM hands{where} ORDER BY started_at, hand_id", params
+        ).fetchall()
 
         net_changes = [
             float(
@@ -3754,17 +4051,13 @@ class MainWindow(QMainWindow):
             showdown=showdown_changes,
             allin_adj=allin_adj_changes,
             nonshowdown=nonshowdown_changes,
+            bb_cents=[float(r["bb_cents"] or 0) for r in graph_rows],
+            rakeback_bb=float(o["net_bb_post_rb"] - o["net_bb"]),
         )
         if (
             getattr(self, "graph_popout_graph", None) is not None
         ):
-            self.graph_popout_graph.set_series_changes(
-                net=net_changes,
-                net_post_rb=net_post_rb_changes,
-                showdown=showdown_changes,
-                allin_adj=allin_adj_changes,
-                nonshowdown=nonshowdown_changes,
-            )
+            self.graph_popout_graph.copy_series_from(self.graph)
 
         self.refresh_hands(f)
         self.refresh_sessions(f)
