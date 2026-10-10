@@ -1770,7 +1770,7 @@ class MainWindow(QMainWindow):
         self._close_after_export = False
 
         self.setWindowTitle(
-            "CoinPoker Tracker v1.0.8"
+            "CoinPoker Tracker v1.0.9"
         )
         self.resize(
             1280,
