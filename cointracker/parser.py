@@ -344,6 +344,88 @@ def _collection_segments(hand: Hand, targets: list[float]) -> list[tuple[float, 
         out.append((hero_amt, winners))
     return out
 
+def _later_known_allin_sidepot_adjustment(
+    hand: Hand,
+    results: dict[str, PlayerResult],
+    shown_cards: dict[str, str],
+    folded_players: set[str],
+) -> tuple[float, float | None, bool, bool] | None:
+    """Adjust independently locked, fully revealed side pots.
+
+    A preflop short-stack all-in can coexist with a *later* flop all-in.
+    Unknown cards of a player who called the main pot but folded on the flop
+    must not prevent computing equity for the separate heads-up side pot.
+    Return None when this safe partial calculation is not applicable.
+    """
+    hero = results[hand.hero_name]
+    effective = {p: max(0, r.contributed_cents - r.returned_cents)
+                 for p, r in results.items()}
+    levels = sorted({c for c in effective.values() if c > 0})
+    if len(levels) < 2 or hand.run_count != 1:
+        return None
+    gross = sum(effective.values())
+    player_pot = hand.total_pot_cents - hand.splash_cents
+    net = player_pot - hand.rake_cents - hand.splash_fee_cents
+    if gross <= 0 or net <= 0 or abs(gross - player_pot) > 1:
+        return None
+    layers = []
+    prev = 0
+    for level in levels:
+        contributors = [p for p, c in effective.items() if c >= level]
+        layers.append((prev, level, contributors, (level - prev) * len(contributors)))
+        prev = level
+    segments = _collection_segments(hand, [amount * net / gross for _, _, _, amount in layers])
+    if segments is None:
+        return None
+    expected_delta = 0.0
+    weighted_eq = 0.0
+    adjusted_amount = 0.0
+    for i, (bottom, level, contributors, gross_layer) in enumerate(layers):
+        if hand.hero_name not in contributors or len(contributors) < 2:
+            continue
+        # The new side-pot eligibility and lock time must be unambiguous:
+        # all contributors have revealed cards, none later folded, and the
+        # all-in covers the complete interval between these contribution caps.
+        if any(p in folded_players or len(shown_cards.get(p, '').split()) != 2
+               for p in contributors):
+            continue
+        locks = [a for a in hand.actions
+                 if a.action == 'ALLIN' and a.street != 'RIVER'
+                 and a.player in contributors and effective[a.player] >= level
+                 and a.amount_cents > 0]
+        if not locks:
+            continue
+        lock = max(locks, key=lambda a: a.seq)
+        # Only the side pot above an earlier all-in is covered by this path;
+        # keep the existing main-pot logic unchanged.
+        if not any(a.action == 'ALLIN' and a.seq < lock.seq
+                   and effective.get(a.player, 0) <= bottom
+                   for a in hand.actions):
+            continue
+        if any(a.seq > lock.seq and a.action in _VOLUNTARY_MONEY_ACTIONS
+               and a.player in contributors
+               and _STREET_ORDER.get(a.street, -1) > _STREET_ORDER.get(lock.street, -1)
+               for a in hand.actions):
+            continue
+        board = {'PREFLOP': '', 'FLOP': ' '.join(hand.boards[0].split()[:3]),
+                 'TURN': ' '.join(hand.boards[0].split()[:4])}.get(lock.street)
+        if board is None or (lock.street != 'PREFLOP' and not board):
+            continue
+        eqs = exact_equities([shown_cards[p] for p in contributors], board)
+        if eqs is None:
+            continue
+        equity = eqs[contributors.index(hand.hero_name)]
+        net_layer = gross_layer * net / gross
+        actual_hero, _ = segments[i]
+        expected_delta += net_layer * equity - actual_hero
+        weighted_eq += net_layer * equity
+        adjusted_amount += net_layer
+    if adjusted_amount == 0:
+        return None
+    return (hero.net_cents + expected_delta,
+            weighted_eq / adjusted_amount, True, False)
+
+
 def _allin_adjustment(
     hand: Hand,
     results: dict[str, PlayerResult],
@@ -389,7 +471,10 @@ def _allin_adjustment(
             for b in post_first
         )
         if prior_after_allin and fold.player not in shown_cards:
-            return actual, None, False, False
+            partial = _later_known_allin_sidepot_adjustment(
+                hand, results, shown_cards, folded_players
+            )
+            return partial if partial is not None else (actual, None, False, False)
     effective = {
         player: max(0, pr.contributed_cents - pr.returned_cents)
         for player, pr in results.items()
