@@ -28,7 +28,7 @@ from .replayer import HandReplayerDialog
 
 
 OVERVIEW_CARD_TITLES = [
-    "Hands", "Net Won","All-in Adj Net Won","bb/100","Adj bb/100", "Net Won post RB", "bb/100 post RB",
+    "Hands", "Net Won","All-in Adj Net Won", "All-in Adj post RB","bb/100","Adj bb/100", "Adj bb/100 post RB", "Net Won post RB", "bb/100 post RB",
      "VPIP", "PFR",  "3-Bet", "All-in Adj BB",  "AI adj hands",  "WWSF", "WTSD", "W$SD",
      "Splash won", "Splash hands", "RIT hands", "Rakeback Amount",
 ]
@@ -41,8 +41,10 @@ CARD_ACCENTS = {
     "bb/100": "#10b981",
     "bb/100 post RB": "#34d399",
     "All-in Adj Net Won": "#eab308",
+    "All-in Adj post RB": "#a3e635",
     "All-in Adj BB": "#facc15",
     "Adj bb/100": "#fde047",
+    "Adj bb/100 post RB": "#bef264",
     "AI adj hands": "#fb923c",
     "VPIP": "#38bdf8",
     "PFR": "#60a5fa",
@@ -194,6 +196,16 @@ class StatCard(QFrame):
         elif title == "Rakeback Amount":
             self.setToolTip(
                 "Manual rakeback stored for the selected stake(s)."
+            )
+        elif title == "All-in Adj post RB":
+            self.setToolTip(
+                "All-in adjusted net winnings plus manual rakeback stored "
+                "for the selected stake(s)."
+            )
+        elif title == "Adj bb/100 post RB":
+            self.setToolTip(
+                "All-in adjusted big blinds per 100 hands after adding manual "
+                "rakeback in big-blind terms for the selected stake(s)."
             )
         elif title == "Net Won post RB":
             self.setToolTip(
@@ -1770,7 +1782,7 @@ class MainWindow(QMainWindow):
         self._close_after_export = False
 
         self.setWindowTitle(
-            "CoinPoker Tracker v1.0.9"
+            "CoinPoker Tracker v1.0.8"
         )
         self.resize(
             1280,
@@ -3940,11 +3952,17 @@ class MainWindow(QMainWindow):
             "All-in Adj Net Won": fmt_money(
                 o["allin_adj_cents"]
             ),
+            "All-in Adj post RB": fmt_money(
+                o["allin_adj_post_rb_cents"]
+            ),
             "All-in Adj BB": (
                 f"{o['allin_adj_bb']:.2f}"
             ),
             "Adj bb/100": (
                 f"{o['allin_adj_bb100']:.2f}"
+            ),
+            "Adj bb/100 post RB": (
+                f"{o['allin_adj_bb100_post_rb']:.2f}"
             ),
             "AI adj hands": (
                 f"{o['allin_adjusted_hands']:,}"

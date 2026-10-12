@@ -768,14 +768,18 @@ class TrackerDB:
         net_bb = float(r["net_bb"] or 0)
         rakeback_cents, rakeback_bb = self._rakeback_totals(filters)
         post_rb_net_cents = net_cents + rakeback_cents
+        allin_adj_post_rb_cents = float(r["allin_adj_cents"] or 0) + rakeback_cents
         post_rb_net_bb = net_bb + rakeback_bb
+        post_rb_adj_bb = float(r["allin_adj_bb"] or 0) + rakeback_bb
         return {
             "hands": hands,
             "net_cents": net_cents,
             "rakeback_cents": rakeback_cents,
             "net_post_rb_cents": post_rb_net_cents,
+            "allin_adj_post_rb_cents": allin_adj_post_rb_cents,
             "net_bb_post_rb": post_rb_net_bb,
             "bb100_post_rb": (post_rb_net_bb * 100 / hands) if hands else 0.0,
+            "allin_adj_bb100_post_rb": (post_rb_adj_bb * 100 / hands) if hands else 0.0,
             "allin_adj_cents": float(r["allin_adj_cents"] or 0),
             "splash_won_cents": r["splash_won_cents"] or 0,
             "rake_cents": r["rake_cents"] or 0,
